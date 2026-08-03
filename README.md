@@ -1,0 +1,2 @@
+# esp32_tester
+用EP4309NV3屏和esp32开发的刷题机器
