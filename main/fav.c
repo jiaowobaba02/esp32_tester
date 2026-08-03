@@ -16,6 +16,7 @@ static const char *TAG = "fav";
 
 #define FAV_SLOT  1024
 #define FAV_MAGIC 0x4656   /* "FV" */
+#define FAV_DELETED 0x0000 /* 已删除标记 (flash 只能 1→0 写, 写 0 即删) */
 
 typedef struct {
     uint16_t magic;
@@ -49,18 +50,44 @@ void fav_init(void)
     }
 }
 
-/* count 不存储: 扫描槽位 (flash 不能 0→1 写, 存 count 无法更新) */
+/* 槽位映射缓存: 扫描一次记录每个有效收藏的物理槽号, 避免每次读取全分区扫.
+ * s_map_cnt = -1 表示缓存失效 (add/remove 后置 -1) */
+static int s_slot_map[512];
+static int s_map_cnt = -1;
+
+static void fav_refresh(void)
+{
+    int n = 0;
+    uint16_t magic;
+    for (int i = 1; i <= 511; i++) {
+        esp_partition_read(s_part, (uint32_t)i * FAV_SLOT, &magic, 2);
+        if (magic == FAV_MAGIC)
+            s_slot_map[n++] = i;
+    }
+    s_slot_map[n] = -1;
+    s_map_cnt = n;
+}
+
+/* count 不存储: 扫描全部槽位统计有效 magic (删除槽标记 0x0000 跳过) */
 int fav_count(void)
 {
     if (!s_part)
         return 0;
-    uint16_t magic;
-    for (int i = 1; i <= 511; i++) {
-        esp_partition_read(s_part, (uint32_t)i * FAV_SLOT, &magic, 2);
-        if (magic != FAV_MAGIC)
-            return i - 1;
-    }
-    return 511;
+    if (s_map_cnt < 0)
+        fav_refresh();
+    return s_map_cnt;
+}
+
+/* 第 idx 个有效收藏的物理槽号 (0-based, 最新收藏在前); -1=不存在 */
+static int fav_slot_of(int idx)
+{
+    if (!s_part || idx < 0)
+        return -1;
+    if (s_map_cnt < 0)
+        fav_refresh();
+    if (idx >= s_map_cnt)
+        return -1;
+    return s_slot_map[s_map_cnt - 1 - idx];   /* 最新在前 */
 }
 
 /* 调试: 打印分区头 */
@@ -75,13 +102,18 @@ void fav_debug(void)
 
 static int fav_is_dup(const quiz_q_t *q)
 {
-    for (int i = 0; i < fav_count(); i++) {
+    if (!s_part || !q || !q->content)
+        return 0;
+    if (s_map_cnt < 0)
+        fav_refresh();
+    for (int i = 0; i < s_map_cnt; i++) {       /* 只扫有效槽 (缓存) */
         fav_slot_t slot;
-        esp_partition_read(s_part, (i + 1) * FAV_SLOT, &slot, sizeof(slot));
+        esp_partition_read(s_part, (uint32_t)s_slot_map[i] * FAV_SLOT, &slot, sizeof(slot));
         if (slot.magic != FAV_MAGIC || slot.len <= 1)
             continue;
         slot.data[slot.len] = 0;
-        if (strcmp((char *)slot.data + strlen(q->subject) + 1, q->content) == 0)
+        char *c = strchr((char *)slot.data, '\x01');
+        if (c && strcmp(c + 1, q->content) == 0)
             return 1;
     }
     return 0;
@@ -114,7 +146,21 @@ int fav_add(const quiz_q_t *q)
     slot.len = (uint16_t)strlen(buf);
     memset(slot.data, 0, sizeof(slot.data));
     memcpy(slot.data, buf, slot.len);
-    esp_partition_write(s_part, (cnt + 1) * FAV_SLOT, &slot, sizeof(slot));
+    /* 找第一个从未写过的槽 (0xFFFF).
+     * 删除槽 (0x0000) 复用需先擦除所在扇区 (会波及同扇区其他收藏), 直接跳过 */
+    int slot_no = -1;
+    uint16_t magic;
+    for (int i = 1; i <= 511; i++) {
+        esp_partition_read(s_part, (uint32_t)i * FAV_SLOT, &magic, 2);
+        if (magic == 0xFFFF) {
+            slot_no = i;
+            break;
+        }
+    }
+    if (slot_no < 0)
+        return -1;
+    esp_partition_write(s_part, (uint32_t)slot_no * FAV_SLOT, &slot, sizeof(slot));
+    s_map_cnt = -1;             /* 缓存失效 */
     return 0;   /* count 由 fav_count() 扫描得出 */
 }
 
@@ -122,30 +168,26 @@ int fav_remove(int idx)
 {
     if (!s_part)
         return -1;
-    int cnt = fav_count();
-    if (idx < 0 || idx >= cnt)
+    int phys = fav_slot_of(idx);
+    if (phys < 0)
         return -1;
-    /* 后续槽位移前 */
-    fav_slot_t slot;
-    for (int i = idx + 1; i < cnt; i++) {
-        esp_partition_read(s_part, (i + 1) * FAV_SLOT, &slot, sizeof(slot));
-        esp_partition_write(s_part, (i) * FAV_SLOT, &slot, sizeof(slot));
-    }
-    /* 清最后一个槽位 */
-    memset(&slot, 0xFF, sizeof(slot));
-    esp_partition_write(s_part, cnt * FAV_SLOT, &slot, sizeof(slot));
-    return 0;   /* count 由 fav_count() 扫描得出 */
+    /* flash 只能 1→0 写, 搬移/清 0xFF 都会失败 (旧数据按位与残留);
+     * 把 magic 写成 0x0000 标记删除即可, 数据残留无害 */
+    uint16_t z = FAV_DELETED;
+    int r = esp_partition_write(s_part, (uint32_t)phys * FAV_SLOT, &z, 2);
+    s_map_cnt = -1;             /* 缓存失效 */
+    return r == ESP_OK ? 0 : -1;
 }
 
 int fav_get(int idx)
 {
     if (!s_part)
         return -1;
-    int cnt = fav_count();
-    if (idx < 0 || idx >= cnt)
+    int phys = fav_slot_of(idx);
+    if (phys < 0)
         return -1;
     fav_slot_t slot;
-    esp_partition_read(s_part, (idx + 1) * FAV_SLOT, &slot, sizeof(slot));
+    esp_partition_read(s_part, (uint32_t)phys * FAV_SLOT, &slot, sizeof(slot));
     if (slot.magic != FAV_MAGIC || slot.len <= 1)
         return -1;
     slot.data[slot.len] = 0;
@@ -195,9 +237,11 @@ int fav_contains(const quiz_q_t *q)
 {
     if (!s_part || !q || !q->content)
         return 0;
-    for (int i = 0; i < fav_count(); i++) {
+    if (s_map_cnt < 0)
+        fav_refresh();
+    for (int i = 0; i < s_map_cnt; i++) {       /* 只扫有效槽 (缓存) */
         fav_slot_t slot;
-        esp_partition_read(s_part, (i + 1) * FAV_SLOT, &slot, sizeof(slot));
+        esp_partition_read(s_part, (uint32_t)s_slot_map[i] * FAV_SLOT, &slot, sizeof(slot));
         if (slot.magic != FAV_MAGIC || slot.len <= 1)
             continue;
         slot.data[slot.len] = 0;

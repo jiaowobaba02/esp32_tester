@@ -9,6 +9,8 @@
 #include "weak.h"
 #include "esp_partition.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -18,10 +20,17 @@ static const char *TAG = "weak";
 #define WEAK_MAGIC  0x574B
 #define WEAK_MAX    20
 #define WEAK_AI_OFF 4096
+#define WEAK_AI_SIZE 4096     /* AI 区 [4096, 8192): 1 扇区 (总结 ≤4KB) */
+#define WEAK_KB_OFF 8192      /* 知识库区 [8192, 32768): 6 主题槽 × 4KB */
+#define WEAK_KB_CNT 6
+#define WEAK_KB_SLOT 4096
+#define WEAK_KB_NAME_SZ 64    /* 槽内主题名区 (含 \0) */
 #define WEAK_CSTR   124   /* 每项 4+124=128 字节, len 用 4 字节 (flash 对齐) */
 
 static const esp_partition_t *s_part;
-static char s_ai_buf[1024];
+static char s_ai_buf[4096];
+static char s_kb_buf[4096];
+static char s_kb_name_buf[WEAK_KB_NAME_SZ];
 
 void weak_init(void)
 {
@@ -40,6 +49,19 @@ void weak_init(void)
         esp_partition_erase_range(s_part, 0, s_part->size);
         uint32_t init = WEAK_MAGIC;          /* 只写 magic (count 用扫描) */
         esp_partition_write(s_part, 0, &init, 4);
+    }
+    /* KB 区格式版本: v2 = 6 主题槽 (名称+内容); 旧格式清空重来 */
+    nvs_handle_t h;
+    int32_t ver = 0;
+    if (nvs_open("weak", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_get_i32(h, "kb_ver", &ver);
+        if (ver != 2) {
+            esp_partition_erase_range(s_part, WEAK_KB_OFF,
+                                      WEAK_SLOT - WEAK_KB_OFF);
+            nvs_set_i32(h, "kb_ver", 2);
+            nvs_commit(h);
+        }
+        nvs_close(h);
     }
 }
 
@@ -129,5 +151,76 @@ void weak_set_ai(int subject_idx, const char *text)
     if (!s_part || subject_idx < 0 || subject_idx > 8 || !text)
         return;
     uint32_t pos = off_of(subject_idx) + WEAK_AI_OFF;
-    esp_partition_write(s_part, pos, text, (uint32_t)strlen(text) + 1);
+    uint32_t len = (uint32_t)strlen(text);
+    if (len >= WEAK_AI_SIZE) {                /* 不得超过 AI 区 */
+        len = WEAK_AI_SIZE - 2;
+        while (len > 0 && ((uint8_t)text[len] & 0xC0) == 0x80)   /* UTF-8 边界回退 */
+            len--;
+        if (len > 0 && (uint8_t)text[len] >= 0xC0)
+            len--;
+    }
+    /* flash 只能 1→0 写: 覆盖写会与旧数据按位与产生乱码。
+     * AI 区 [4096, 8192) 恰好 1 个整扇区, 先擦除再写 (不影响错题区) */
+    esp_partition_erase_range(s_part, pos, WEAK_AI_SIZE);
+    esp_partition_write(s_part, pos, text, len + 1);
+}
+
+/* ---------- 知识库 (每科 6 主题槽, 每槽 4KB 整扇区)
+ * 槽布局: [0..63] 主题名 (\0 结尾) + [64..] 内容 (\0 结尾); 空槽全 0xFF */
+const char *weak_get_kb_name(int subject_idx, int slot)
+{
+    s_kb_name_buf[0] = 0;
+    if (!s_part || subject_idx < 0 || subject_idx > 8 ||
+        slot < 0 || slot >= WEAK_KB_CNT)
+        return s_kb_name_buf;
+    uint32_t pos = off_of(subject_idx) + WEAK_KB_OFF + (uint32_t)slot * WEAK_KB_SLOT;
+    esp_partition_read(s_part, pos, s_kb_name_buf, WEAK_KB_NAME_SZ);
+    s_kb_name_buf[WEAK_KB_NAME_SZ - 1] = 0;
+    if ((uint8_t)s_kb_name_buf[0] == 0xFF)   /* 空槽 */
+        s_kb_name_buf[0] = 0;
+    return s_kb_name_buf;
+}
+
+const char *weak_get_kb(int subject_idx, int slot)
+{
+    s_kb_buf[0] = 0;
+    if (!s_part || subject_idx < 0 || subject_idx > 8 ||
+        slot < 0 || slot >= WEAK_KB_CNT)
+        return s_kb_buf;
+    uint32_t pos = off_of(subject_idx) + WEAK_KB_OFF + (uint32_t)slot * WEAK_KB_SLOT;
+    uint8_t hdr = 0;
+    esp_partition_read(s_part, pos, &hdr, 1);
+    if (hdr == 0xFF)                          /* 空槽 */
+        return s_kb_buf;
+    esp_partition_read(s_part, pos + WEAK_KB_NAME_SZ, s_kb_buf, sizeof(s_kb_buf) - 1);
+    s_kb_buf[sizeof(s_kb_buf) - 1] = 0;
+    return s_kb_buf;
+}
+
+void weak_set_kb(int subject_idx, int slot, const char *name, const char *text)
+{
+    if (!s_part || subject_idx < 0 || subject_idx > 8 ||
+        slot < 0 || slot >= WEAK_KB_CNT || !text)
+        return;
+    uint32_t pos = off_of(subject_idx) + WEAK_KB_OFF + (uint32_t)slot * WEAK_KB_SLOT;
+    uint32_t len = (uint32_t)strlen(text);
+    if (len >= WEAK_KB_SLOT - WEAK_KB_NAME_SZ - 1) {   /* 不得超过槽内内容区 */
+        len = WEAK_KB_SLOT - WEAK_KB_NAME_SZ - 2;
+        while (len > 0 && ((uint8_t)text[len] & 0xC0) == 0x80)   /* UTF-8 边界回退 */
+            len--;
+        if (len > 0 && (uint8_t)text[len] >= 0xC0)
+            len--;
+    }
+    esp_partition_erase_range(s_part, pos, WEAK_KB_SLOT);   /* 整扇区擦除再写 */
+    esp_partition_write(s_part, pos, name, (uint32_t)strlen(name) + 1);
+    esp_partition_write(s_part, pos + WEAK_KB_NAME_SZ, text, len + 1);
+}
+
+void weak_clear_kb(int subject_idx, int slot)
+{
+    if (!s_part || subject_idx < 0 || subject_idx > 8 ||
+        slot < 0 || slot >= WEAK_KB_CNT)
+        return;
+    uint32_t pos = off_of(subject_idx) + WEAK_KB_OFF + (uint32_t)slot * WEAK_KB_SLOT;
+    esp_partition_erase_range(s_part, pos, WEAK_KB_SLOT);
 }

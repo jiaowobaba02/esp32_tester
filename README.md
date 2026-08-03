@@ -39,26 +39,36 @@ BOOT 键:   GPIO0 (低电平按下, 兜底导航)
 
 - **本地刷题**: 9 科菜单 → 题目 → 点选项判分 → 解析翻页 (题库 100 题, 每科 10 题)
 - **AI 出题**: 菜单 → AI 出题 → 选科目 → DeepSeek 按年级生成 (答完自动再出一题, 失败可重试)
-- **收藏**: 答题页顶栏 ☆收藏/★已藏 → 菜单"收藏"查看 (favorites 分区, 最多 511 题,
-  列表每页 5 条, 底部 [上页][页码][下页] 翻页)
+- **收藏**: 答题页顶栏 ☆收藏/★已藏 (收藏题查看页点 ★ 即取消并返回列表) →
+  菜单"收藏"查看 (favorites 分区, 最多 511 题, **最新收藏在前**, 同一题不可重复收藏,
+  列表每页 5 条, 每行右侧 [移除] 直接删藏, 底部 [上页][页码][下页] 翻页)
 - **薄弱点**: 答错自动记录 (weakness 分区 9×32KB) → 菜单"薄弱点"选科 →
-  错题列表 (每页 4 条, 左/右半屏翻页) + AI 分析总结 (全屏可翻页, 底部可切回错题列表)
-- **长文本翻页**: 题目全文 / 解析 / 薄弱点总结超过一屏时进入全屏阅读页,
+  错题列表 (每页 4 条, 左/右半屏翻页) + **逐题选择分析** (勾选要分析的题 →
+  AI 按"题N"逐题点评知识点/错因/建议, 全屏可翻页)
+- **知识库**: 菜单 → 知识库 → 选科目 → 主题池 (每科 6 槽: 4 预置 + 自定义)
+  → 生成该主题核心知识点 (900 字级, 缓存可反复查看) → 全屏翻页
+  - 列表可翻页 (每页 5 行), 已生成主题右侧 [删除] 可删减
+  - **[自定义主题]**: 软键盘输入拼音/英文 (如 PCR yuanli) → AI 自动转中文标题
+    (PCR原理) 后生成; 槽满提示先删除
+- **长文本翻页**: 题目全文 / 解析 / 薄弱点总结 / 知识库超过一屏时进入全屏阅读页,
   **左半屏 = 上一页, 右半屏 = 下一页**, 边界点击退出 (长按亦可返回)
+- **自适应分页**: 答题页题干超过 4 行自动分页, 选项文字超过 2 行自动分页,
+  控件行 [−][页码][+] 或点题目区翻页, 无需跳全屏
 - **主题**: 明亮/护眼/夜间 (设置页切换, NVS 保存)
 - **亮度**: LEDC PWM 背光 1-100% (设置页左减右加, NVS 保存)
 - **年级**: 高一/高二/高三 (设置页切换, AI 出题按年级适配)
 - **设置**: 扫描 WiFi (中文 SSID 支持) → 软键盘输密码 (数字/符号/大小写) → 自动连接保存
 - **API Key**: WiFi 连上后浏览器访问 `http://IP:8080` 粘贴保存 (NVS)
-- **顶栏**: 各页显示"长按返回"提示 + IP (5x7 小字)
-- **触摸**: 点按操作, 长按 900ms = 返回
+- **顶栏**: 右上角返回键图形 + IP 小字; 答题页顶栏长按/点右上角返回 (收藏题回收藏夹)
+- **触摸**: 点按操作, 长按 900ms = 返回 (答题顶栏/解析页/键盘页均可长按返回)
 - **BOOT 键**: 全程兜底 (短按/长按)
 
 ## 使用流程
 
 1. 上电 → 菜单页
 2. 点科目 → 本地刷题; 点"AI 出题" → 选科目 → AI 生成
-3. 答题: 点选项直接判分; 长题目点题目区看全文, 答完点解析区看完整解析 (均可翻页)
+3. 答题: 点选项直接判分; 长题目点题目区看全文, 答完点解析区看完整解析 (均可翻页);
+   收藏夹点行查看, 点行右侧 [移除] 删藏
 4. 设置: 右下角"设置" → 扫描 WiFi / 手动输入 → 密码键盘 → 完成自动连接
 5. API Key: WiFi 连上后菜单左下角显示 IP, 浏览器打开 `http://IP:8080`
 
@@ -99,15 +109,42 @@ sdkconfig.defaults (TLS 跳过证书验证 / 主任务栈 16KB / flash 4MB),
 
 ```
 main/main.c          主程序 (驱动 + UI + 状态机)
-main/font_cn.c       16x16 中文字库 (GB2312 7445 字)
+main/font_cn.c       16x16 中文字库 (7445 汉字 + 33 科学符号, unicode 有序二分查找)
 main/ascii16.c       14x16 雅黑 ASCII 字库
 main/questions.c     本地题库 (100 题, 每科 10 题)
-main/ai_quiz.c       DeepSeek API 出题 + 薄弱点分析
-main/fav.c           收藏 (favorites 分区, 511 题)
-main/weak.c          薄弱点 (weakness 分区, 9×32KB)
+main/ai_quiz.c       DeepSeek API 出题 + 薄弱点分析 + 知识库生成 + 拼音转中文
+main/fav.c           收藏 (favorites 分区, 511 槽, 标记删除 + 槽位映射缓存)
+main/weak.c          薄弱点 (weakness 分区, 9×32KB) + 知识库主题池 (每科 6 槽)
 partitions.csv       自定义分区表 (factory 2MB + weakness + favorites)
 sdkconfig.defaults   TLS insecure + 大任务栈 + flash 4MB
 ```
+
+## 直接烧录固件 (免编译)
+
+发布包的 `firmware/` 目录含编译好的固件, 用 esptool 直接烧录:
+
+```bash
+# 方式 1: 用 ESP-IDF (推荐)
+cd esp32_tester
+. $IDF_PATH/export.sh
+python -m esptool --chip esp32 -p /dev/ttyUSB0 -b 460800 \
+  --before default_reset --after hard_reset write_flash --flash_mode dio \
+  --flash_freq 40m --flash_size 4MB \
+  0x1000 firmware/bootloader.bin \
+  0x8000 firmware/partition-table.bin \
+  0x10000 firmware/st6201_spi_lcd.bin
+
+# 方式 2: 任意 Python 环境 (pip install esptool)
+esptool --chip esp32 -p /dev/ttyUSB0 -b 460800 \
+  --before default_reset --after hard_reset write_flash --flash_mode dio \
+  --flash_freq 40m --flash_size 4MB \
+  0x1000 firmware/bootloader.bin \
+  0x8000 firmware/partition-table.bin \
+  0x10000 firmware/st6201_spi_lcd.bin
+```
+
+烧录后上电: 设置 → 扫描 WiFi → 输入密码; 浏览器打开 http://IP:8080 粘贴 DeepSeek
+API Key, 即可使用全部功能。
 
 ## 已知限制
 
@@ -120,5 +157,3 @@ sdkconfig.defaults   TLS insecure + 大任务栈 + flash 4MB
 
 - 串口 115200: 日志 (tap 坐标 / wifi 状态 / ai 结果)
 - 触摸坐标: 校准数据 (5 点: 左上 65,40 / 左下 64,230 / 右下 416,220 / 中心 242,144)
-
->注：该项目完全由Deepseek-v4-flash-0731 编写，总共耗费8.39美元，我不推荐该代码商用，除非你能承受其不稳定性

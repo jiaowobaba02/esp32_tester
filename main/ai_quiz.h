@@ -12,4 +12,10 @@ int ai_generate_question(const char *subject);
 /* AI 薄弱点分析: 根据错题 topics 返回简要分析文本 (静态缓冲) */
 const char *ai_analyze_weakness(const char *subject, const char *topics);
 
+/* AI 知识库: 生成 subject 科目 topic 主题的核心知识点 (静态缓冲, 失败返回 "") */
+const char *ai_get_knowledge(const char *subject, const char *topic);
+
+/* AI 拼音/英文主题名 → 中文主题名 (静态缓冲, 失败返回 "") */
+const char *ai_translate_topic(const char *text);
+
 #endif
