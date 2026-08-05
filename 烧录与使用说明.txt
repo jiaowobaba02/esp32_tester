@@ -1,0 +1,44 @@
+========================================
+ ESP32 刷题机 正式版 v2.0
+========================================
+
+【固件文件】firmware/
+  bootloader.bin / partition-table.bin / st6201_spi_lcd.bin
+
+【烧录方法】(需要 ESP-IDF 环境, 或 pip install esptool)
+
+  python -m esptool --chip esp32 -p /dev/ttyUSB0 -b 460800
+    --before default_reset --after hard_reset write_flash
+    --flash_mode dio --flash_freq 40m --flash_size 4MB
+    0x1000 firmware/bootloader.bin
+    0x8000 firmware/partition-table.bin
+    0x10000 firmware/st6201_spi_lcd.bin
+
+  完全擦除(清空所有数据, 慎用):
+  python -m esptool --chip esp32 -p /dev/ttyUSB0 erase_flash
+
+【首次使用】
+  1. 上电 -> 设置 -> 扫描 WiFi -> 输入密码
+  2. WiFi 连接后, 浏览器打开 http://设备IP:8080 粘贴 DeepSeek API Key
+  3. 开始刷题
+
+【本次更新】
+  - 修复: AI 出题连续多道后无法继续 (内存泄漏)
+  - 修复: AI 内容最后一个字/中文括号丢失 (UTF-8 截断回退)
+  - 修复: 知识库无法换行 (AI 输出未分段时自动补行)
+  - 修复: 拼音转中文主题名结合科目 (PCR原理等)
+  - 修复: 薄弱点错题列表最新在前
+  - 修复: 中文字体与英文字体基线对齐
+  - 修复: AI 内容含引号/转义字符时解析失败
+  - 修复: 夜间主题 (AI出题选科页文字不可见/边框对比度)
+  - 修复: 生物等科目"一次启动只能生成一道题"
+  - 新增: 填空题/解答题收藏 (顶栏☆)
+  - 新增: 顶栏时间显示 (SNTP 联网自动校时)
+  - 新增: 收藏 AI 分析 (收藏页底部按钮, 勾选1-5题)
+  - 新增: 出题失败错误码 (E1-E12, 屏幕直接显示)
+
+【说明】
+  - 本版已移除内置 API Key, 必须网页输入 (无个人信息)
+  - 源码在 source/ 目录, 用 ESP-IDF v5.5 构建
+  - 分区表: factory 2MB + weakness + favorites
+========================================

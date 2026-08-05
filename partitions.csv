@@ -1,6 +1,8 @@
 # Name,     Type, SubType, Offset,   Size,    Flags
+# v5: weakness 扩到 1152KB (每科 128KB: 错题 8KB + AI 8KB + 知识库 7槽×16KB)
+#     favorites 移至 0x330000 (旧 0x2A0000 数据由固件启动时自动迁移)
 nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
 factory,    app,  factory, 0x10000,  0x1F0000,
-weakness,   data, spiffs,  0x210000, 0x48000,
-favorites,  data, spiffs,  0x258000, 0x80000,
+weakness,   data, spiffs,  0x210000, 0x120000,
+favorites,  data, spiffs,  0x330000, 0x40000,

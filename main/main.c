@@ -2,11 +2,12 @@
  * ST6201 4.3寸 480x272 IPS —— ETSP32 SPI 驱动 + 基础图形层
  *
  * 官方配置: SPI2_HOST + DMA, CLK=23 MOSI=19 CS=22 DC=14 RST=12 (软件 CS)
- * mode 0, 40MHz, 像素低字节先 (官方 LVGL 小端)
+ * mode 0, 26MHz (GPIO matrix 上限), 像素高字节先 (大端)
  * 背光: GPIO2 + GPIO32(飞线) 高电平开
  */
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -15,12 +16,21 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "gfx_driver.h"
+#include "ui_renderer.h"
+#include "ui_keyboard.h"
 
-#define PIN_SCK   23
-#define PIN_MOSI  19
-#define PIN_CS    22
-#define PIN_DC    14
-#define PIN_RST   12
+/* ---- 兼容别名: 旧 lcd_* 名字 → ui_renderer (迁移过渡期) ---- */
+#define lcd_fill_rect  r_fill_rect
+#define lcd_clear      r_clear
+#define lcd_draw_hline r_draw_hline
+#define lcd_draw_vline r_draw_vline
+#define lcd_draw_rect  r_draw_rect
+#define lcd_draw_text  r_draw_text
+#define lcd_draw_char  r_draw_char_bw16
+#define lcd_draw_cn_char r_draw_cn_char
+#define text_width     r_text_width
+
 #define PIN_BL    2
 #define PIN_BL2   32
 
@@ -30,354 +40,14 @@
 #define TOUCH_RST  4
 #define TOUCH_INT  17
 
-#define LCD_WIDTH   480
-#define LCD_HEIGHT  272
-
-#define WHITE 0xFFFF
-#define BLACK 0x0000
-#define RED   0xF800
-#define GREEN 0x07E0
-#define BLUE  0x001F
-#define YELLOW 0xFFE0
-#define CYAN  0x07FF
-#define MAGENTA 0xF81F
-#define GRAY  0x8430
-
 static const char *TAG = "st6201";
-static spi_device_handle_t s_spi;
-
-/* ---------- 官方初始化序列 ---------- */
-static const uint8_t seq[][2] = {
-    {0xFF,0xA5},{0xE7,0x10},{0x35,0x00},{0x36,0xC0},{0x3A,0x01},{0x40,0x01},
-    {0x41,0x03},{0x44,0x15},{0x45,0x15},{0x7D,0x03},{0xC1,0xBB},{0xC2,0x05},
-    {0xC3,0x10},{0xC6,0x3E},{0xC7,0x25},{0xC8,0x21},{0x7A,0x51},{0x6F,0x49},
-    {0x78,0x57},{0xC9,0x00},{0x67,0x11},{0x51,0x0A},{0x52,0x7D},{0x53,0x0A},
-    {0x54,0x7D},{0x46,0x0A},{0x47,0x2A},{0x48,0x0A},{0x49,0x1A},{0x44,0x15},
-    {0x45,0x15},{0x73,0x08},{0x74,0x10},{0x56,0x43},{0x57,0x42},{0x58,0x3C},
-    {0x59,0x64},{0x5A,0x41},{0x5B,0x3C},{0x5C,0x02},{0x5D,0x3C},{0x5E,0x1F},
-    {0x60,0x80},{0x61,0x3F},{0x62,0x21},{0x63,0x07},{0x64,0xE0},{0x65,0x02},
-    {0xCA,0x20},{0xCB,0x52},{0xCC,0x10},{0xCD,0x42},{0xD0,0x20},{0xD1,0x52},
-    {0xD2,0x10},{0xD3,0x42},{0xD4,0x0A},{0xD5,0x32},
-    {0x80,0x00},{0xA0,0x00},{0x81,0x06},{0xA1,0x08},{0x82,0x03},{0xA2,0x03},
-    {0x86,0x14},{0xA6,0x14},{0x87,0x2C},{0xA7,0x26},{0x83,0x37},{0xA3,0x37},
-    {0x84,0x35},{0xA4,0x35},{0x85,0x3F},{0xA5,0x3F},{0x88,0x0A},{0xA8,0x0A},
-    {0x89,0x13},{0xA9,0x12},{0x8A,0x18},{0xAA,0x19},{0x8B,0x0A},{0xAB,0x0A},
-    {0x8C,0x17},{0xAC,0x0B},{0x8D,0x1A},{0xAD,0x09},{0x8E,0x1A},{0xAE,0x08},
-    {0x8F,0x1F},{0xAF,0x00},{0x90,0x08},{0xB0,0x00},{0x91,0x10},{0xB1,0x06},
-    {0x92,0x19},{0xB2,0x15},{0xFF,0x00},
-};
-
-/* ---------- SPI 底层 (CS 软件控制) ---------- */
-static void lcd_cmd(uint8_t cmd)
-{
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 0);
-    t.length = 8;
-    t.tx_buffer = &cmd;
-    spi_device_transmit(s_spi, &t);
-    gpio_set_level(PIN_CS, 1);
-}
-
-static void lcd_data(const uint8_t *buf, size_t len)
-{
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 1);
-    while (len) {
-        size_t chunk = len > 4096 ? 4096 : len;
-        spi_transaction_t t;
-        memset(&t, 0, sizeof(t));
-        t.length = chunk * 8;
-        t.tx_buffer = buf;
-        spi_device_transmit(s_spi, &t);
-        buf += chunk;
-        len -= chunk;
-    }
-    gpio_set_level(PIN_CS, 1);
-}
-
-/* ---------- 初始化 ---------- */
-static void lcd_init(void)
-{
-    gpio_set_level(PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
-        lcd_cmd(seq[i][0]);
-        uint8_t d = seq[i][1];
-        lcd_data(&d, 1);
-    }
-    lcd_cmd(0x11);
-    vTaskDelay(pdMS_TO_TICKS(120));
-    lcd_cmd(0x29);
-    vTaskDelay(pdMS_TO_TICKS(20));
-}
-
-/* ---------- 图形原语 ---------- */
-static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
-{
-    uint8_t b[4];
-    lcd_cmd(0x2A);
-    b[0]=x0>>8; b[1]=x0&0xFF; b[2]=x1>>8; b[3]=x1&0xFF; lcd_data(b, 4);
-    lcd_cmd(0x2B);
-    b[0]=y0>>8; b[1]=y0&0xFF; b[2]=y1>>8; b[3]=y1&0xFF; lcd_data(b, 4);
-    lcd_cmd(0x2C);
-}
-
-/* 推送像素: 必须已设窗口; CS 全程低 (数据流不中断) */
-/* ⚠️ 实测: 屏按大端解析 (高字节先) — 小端会 R→B/G→R/B→G 通道错乱 */
-static void lcd_push_pixels(const uint16_t *buf, uint32_t n)
-{
-    static uint8_t big[8192];
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 1);
-    uint32_t i = 0;
-    while (i < n) {
-        uint32_t chunk_n = (n - i > 4096 / 2) ? 4096 / 2 : (n - i);
-        for (uint32_t j = 0; j < chunk_n; j++) {
-            big[j * 2]     = buf[i + j] >> 8;   /* 高字节先 */
-            big[j * 2 + 1] = buf[i + j] & 0xFF;
-        }
-        spi_transaction_t t;
-        memset(&t, 0, sizeof(t));
-        t.length = chunk_n * 16;
-        t.tx_buffer = big;
-        spi_device_transmit(s_spi, &t);
-        i += chunk_n;
-    }
-    gpio_set_level(PIN_CS, 1);
-}
-
-void lcd_fill_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint16_t color)
-{
-    /* 边界裁剪 (int32 正确处理负坐标) */
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 >= LCD_WIDTH) x1 = LCD_WIDTH - 1;
-    if (y1 >= LCD_HEIGHT) y1 = LCD_HEIGHT - 1;
-    if (x0 > x1 || y0 > y1 || x0 >= LCD_WIDTH || y0 >= LCD_HEIGHT)
-        return;
-
-    uint32_t n = (uint32_t)(x1 - x0 + 1) * (y1 - y0 + 1);
-    static uint8_t buf[2048 * 2];              /* 大端: 高字节先, 4KB 大块减少事务数 */
-    lcd_set_window((uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1);
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 1);
-    uint32_t i = 0;
-    while (i < n) {
-        uint32_t chunk = (n - i > 2048) ? 2048 : (n - i);
-        for (uint32_t j = 0; j < chunk; j++) {
-            buf[j * 2]     = color >> 8;       /* 高字节先 */
-            buf[j * 2 + 1] = color & 0xFF;
-        }
-        spi_transaction_t t;
-        memset(&t, 0, sizeof(t));
-        t.length = chunk * 16;
-        t.tx_buffer = buf;
-        spi_device_transmit(s_spi, &t);
-        i += chunk;
-    }
-    gpio_set_level(PIN_CS, 1);
-}
-
-void lcd_clear(uint16_t color)
-{
-    lcd_fill_rect(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1, color);
-}
-
-void lcd_draw_hline(int32_t x0, int32_t x1, int32_t y, uint16_t color)
-{
-    lcd_fill_rect(x0, y, x1, y, color);
-}
-
-void lcd_draw_vline(int32_t x, int32_t y0, int32_t y1, uint16_t color)
-{
-    lcd_fill_rect(x, y0, x, y1, color);
-}
-
-void lcd_draw_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint16_t color)
-{
-    lcd_draw_hline(x0, x1, y0, color);
-    lcd_draw_hline(x0, x1, y1, color);
-    lcd_draw_vline(x0, y0, y1, color);
-    lcd_draw_vline(x1, y0, y1, color);
-}
-
-
-/* 画字符 (x,y 左上角): 14x16 平滑雅黑 ASCII (ascii16.c) */
-#include "ascii16.h"
-
-static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg)
-{
-    if (c < 0x20 || c > 0x7E) return;
-    const uint8_t *g = ascii16_data[c - 0x20];
-    static uint8_t buf[14 * 16 * 2];           /* 大端直存, 与 fill_rect 一致 */
-    for (int row = 0; row < 16; row++) {
-        uint8_t b0 = g[row * 2], b1 = g[row * 2 + 1];
-        for (int col = 0; col < 14; col++) {
-            int bit = (col < 8) ? (b0 >> (7 - col))
-                                : (b1 >> (13 - col));
-            uint16_t px = (bit & 1) ? fg : bg;
-            buf[(row * 14 + col) * 2]     = px >> 8;
-            buf[(row * 14 + col) * 2 + 1] = px & 0xFF;
-        }
-    }
-    lcd_set_window(x, y, x + 13, y + 15);
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 1);
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 14 * 16 * 16;
-    t.tx_buffer = buf;
-    spi_device_transmit(s_spi, &t);
-    gpio_set_level(PIN_CS, 1);
-}
-
-void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
-{
-    while (*s) {
-        lcd_draw_char(x, y, *s++, fg, bg);
-        x += 17;
-    }
-}
-
-/* ---------- 16x16 中文 (font_cn.bin 生成, unicode 有序, 二分查找) ---------- */
-#include "font_cn.h"
-
-static void lcd_draw_cn_char(uint16_t x, uint16_t y, uint16_t code, uint16_t fg, uint16_t bg)
-{
-    int lo = 0, hi = font_cn_count - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        const uint8_t *p = &font_cn_data[2 + mid * 34];
-        uint16_t c = p[0] | (p[1] << 8);
-        if (c == code) {
-            const uint8_t *g = p + 2;
-            static uint16_t buf[256];
-            for (int row = 0; row < 16; row++) {
-                for (int col = 0; col < 16; col++) {
-                    int bit = (col < 8) ? (g[row*2]   >> (7 - col))
-                                        : (g[row*2+1] >> (15 - col));
-                    buf[row * 16 + col] = (bit & 1) ? fg : bg;
-                }
-            }
-            lcd_set_window(x, y, x + 15, y + 15);
-            lcd_push_pixels(buf, 256);
-            return;
-        } else if (c < code) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    /* 缺字: 画方框 */
-    lcd_draw_rect(x, y, x + 15, y + 15, fg);
-}
-
-/* UTF-8 混合文本: ASCII 14x16 (15px), 中文 16x16 (17px), \n 换行 */
-void lcd_draw_text(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
-{
-    uint16_t cx = x;
-    while (*s) {
-        uint8_t c = *s;
-        if (c < 0x80) {
-            if (c == '\n') { cx = x; y += 18; s++; continue; }
-            lcd_draw_char(cx, y, c, fg, bg);
-            cx += 17;
-            s++;
-        } else if ((c & 0xE0) == 0xC0) {          /* 2 字节 */
-            uint16_t code = ((c & 0x1F) << 6) | (s[1] & 0x3F);
-            lcd_draw_cn_char(cx, y, code, fg, bg);
-            cx += 17;
-            s += 2;
-        } else if ((c & 0xF0) == 0xE0) {          /* 3 字节 CJK */
-            uint16_t code = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-            lcd_draw_cn_char(cx, y, code, fg, bg);
-            cx += 17;
-            s += 3;
-        } else {
-            s++;
-        }
-    }
-}
-
 /* ================================================================
- * GT911 触摸 — 软件 I2C (bit-bang) 实现
- * 原因: ESP32 I2C 外设轮询 GT911 会挂死主循环(旧/新驱动都卡),
- *       软件 I2C 完全可控, 不会死锁 (MicroPython SoftI2C 同思路)
+ * GT911 触摸 — 硬件 I2C (400kHz, 已验证稳定)
  * ================================================================ */
-static uint8_t s_touch_addr;
 static int touch_init_done = 0;
 static uint16_t s_xmax = LCD_WIDTH, s_ymax = LCD_HEIGHT;
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
-
-/* ---------- 软件 I2C (开漏输出 + 内部上拉) ---------- */
-static void i2c_delay(void)
-{
-    esp_rom_delay_us(10);                   /* ~100kHz 标准模式 */
-}
-
-static void i2c_start(void)
-{
-    gpio_set_level(TOUCH_SDA, 1);
-    gpio_set_level(TOUCH_SCL, 1);
-    i2c_delay();
-    gpio_set_level(TOUCH_SDA, 0);
-    i2c_delay();
-    gpio_set_level(TOUCH_SCL, 0);
-}
-
-static void i2c_stop(void)
-{
-    gpio_set_level(TOUCH_SDA, 0);
-    gpio_set_level(TOUCH_SCL, 1);
-    i2c_delay();
-    gpio_set_level(TOUCH_SDA, 1);
-    i2c_delay();
-}
-
-static int i2c_write_byte(uint8_t b)
-{
-    for (int i = 7; i >= 0; i--) {
-        gpio_set_level(TOUCH_SDA, (b >> i) & 1);
-        i2c_delay();
-        gpio_set_level(TOUCH_SCL, 1);
-        i2c_delay();
-        gpio_set_level(TOUCH_SCL, 0);
-    }
-    /* ACK: SDA 释放, 读从机应答 */
-    gpio_set_level(TOUCH_SDA, 1);
-    i2c_delay();
-    gpio_set_level(TOUCH_SCL, 1);
-    i2c_delay();
-    int ack = gpio_get_level(TOUCH_SDA);
-    gpio_set_level(TOUCH_SCL, 0);
-    return ack;                              /* 0=ACK */
-}
-
-static uint8_t i2c_read_byte(int send_ack)
-{
-    uint8_t v = 0;
-    gpio_set_level(TOUCH_SDA, 1);
-    for (int i = 0; i < 8; i++) {
-        gpio_set_level(TOUCH_SCL, 1);
-        i2c_delay();
-        v = (v << 1) | gpio_get_level(TOUCH_SDA);
-        gpio_set_level(TOUCH_SCL, 0);
-        i2c_delay();
-    }
-    gpio_set_level(TOUCH_SDA, send_ack ? 0 : 1);   /* ACK=0 / NACK=1 */
-    i2c_delay();
-    gpio_set_level(TOUCH_SCL, 1);
-    i2c_delay();
-    gpio_set_level(TOUCH_SCL, 0);
-    gpio_set_level(TOUCH_SDA, 1);
-    return v;
-}
 
 /* GT911 读 (硬件 I2C) */
 static int gt911_r(uint16_t reg, uint8_t *buf, uint8_t len)
@@ -433,7 +103,6 @@ static int touch_init(void)
 
     static const uint8_t addrs[] = { 0x5D, 0x14 };
     for (int i = 0; i < 2; i++) {
-        s_touch_addr = addrs[i];
         i2c_device_config_t dc = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = addrs[i],
@@ -458,41 +127,6 @@ static int touch_init(void)
     }
     ESP_LOGE(TAG, "GT911 not found (hw i2c)");
     return -1;
-}
-
-/* 硬件 I2C 对照探测 (验证 GT911 是否在线 / 软件 I2C 是否 bug) */
-static void hw_i2c_probe(void)
-{
-    i2c_master_bus_handle_t bus;
-    i2c_master_bus_config_t bc = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = TOUCH_SDA,
-        .scl_io_num = TOUCH_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    if (i2c_new_master_bus(&bc, &bus) != ESP_OK) {
-        ESP_LOGE(TAG, "hw i2c bus init fail");
-        return;
-    }
-    static const uint8_t addrs[] = { 0x5D, 0x14 };
-    for (int i = 0; i < 2; i++) {
-        i2c_device_config_t dc = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = addrs[i],
-            .scl_speed_hz = 400000,        /* 400kHz 快 4 倍 */
-        };
-        i2c_master_dev_handle_t dev;
-        if (i2c_master_bus_add_device(bus, &dc, &dev) != ESP_OK) {
-            ESP_LOGE(TAG, "hw add dev 0x%02X fail", addrs[i]);
-            continue;
-        }
-        uint8_t reg[2] = { 0x81, 0x40 }, id[4] = { 0 };
-        esp_err_t e = i2c_master_transmit_receive(dev, reg, 2, id, 4, 200);
-        ESP_LOGI(TAG, "HW i2c 0x%02X: ret=%s id=%c%c%c",
-                 addrs[i], esp_err_to_name(e), id[0], id[1], id[2]);
-    }
 }
 
 /* 返回 1=有触摸 (官方 EYA gt911.c 逻辑: 每点 4 字节, 小端) */
@@ -539,6 +173,15 @@ static const char *s_subjects[9] = {
     "数学", "物理", "化学", "生物", "英语", "语文", "历史", "政治", "地理"
 };
 
+/* 科目名 → 索引 (0-8), 未知返回 -1 */
+static int subj_of(const char *name)
+{
+    for (int i = 0; i < 9; i++)
+        if (strcmp(name, s_subjects[i]) == 0)
+            return i;
+    return -1;
+}
+
 static int s_state = 0;        /* 0=菜单 1=答题 */
 static int s_menu_sel = 0;
 static int s_qidx = 0;         /* 科目内题号 */
@@ -548,6 +191,8 @@ static int s_opt_sel = 0;      /* 高亮选项 */
 static int s_answered = 0;
 static int s_show_ans = 0;     /* 非选择题: 已显示参考答案 */
 static int s_correct = 0, s_total = 0;
+static char s_fill_buf[64] = "";   /* 填空题: 键盘输入的答案 */
+static int s_fill_ok = 0;          /* 填空题: 判分结果 */
 static int s_exp_page = 0, s_exp_total = 0;   /* 解析页: 页码/总页 */
 static int s_qpage = 0, s_qtotal = 0;         /* 题目全文页: 页码/总行 */
 static int s_wpage = 0, s_wtotal = 0;         /* 薄弱点总结页: 页码/总行 */
@@ -556,6 +201,10 @@ static int s_weak_list_page = 0;              /* 薄弱点错题列表: 页码 *
 static int s_opt_page = 0, s_opt_pages = 1;   /* 答题页选项分页: 页码/总页 */
 static int s_kb_page = 0;                     /* 知识库全文页: 页码 */
 
+/* 全屏翻页: 每页行数 (解析/全文/薄弱点/知识库/收藏分析共用) */
+#define EXP_LINES 12
+#define FULL_LINES 12
+
 static void text_center(int y, const char *s, uint16_t fg, uint16_t bg);
 static void text_center2(int cx, int y, const char *s, uint16_t fg, uint16_t bg);
 static void http_server_start(void);
@@ -563,11 +212,18 @@ static void http_server_start(void);
 /* 设置数据 (WiFi/API 等, 定义在此供 WiFi 代码使用) */
 static char s_wifi_ssid[33] = "";
 static char s_wifi_pass[65] = "";
-char s_api_key[65] = "";         /* 全局: ai_quiz.c 使用 */
-static int s_wifi_state = 0;     /* 0=未连接 1=连接中 2=已连接 */
+char s_api_key[65] = "";         /* 全局: ai_quiz.c 使用 (正式版无内置 Key,
+                                    * 需联网后访问 http://IP:8080 网页输入) */
+int s_wifi_state = 0;             /* 0=未连接 1=连接中 2=已连接 (ai_quiz.c 使用) */
 static char s_wifi_ip[17] = "";
+static char s_time_str[16] = "";  /* 顶栏时间 "MM-DD HH:MM" (SNTP 同步后非空) */
 int s_grade = 2;                 /* 年级: 0=高一 1=高二 2=高三 (ai_quiz.c 使用) */
 static const char *s_grade_names[3] = { "高一", "高二", "高三" };
+int s_diff = 1;                  /* AI 出题难度: 0=基础 1=中等 2=较难 (ai_quiz.c 使用) */
+static const char *s_diff_names[3] = { "基础", "中等", "较难" };
+int s_fill_pct = 20;             /* AI 出题填空概率 % (数理化英, ai_quiz.c 使用) */
+static char s_kb_custom[40] = "";   /* 知识库自定义主题名 */
+static const char *s_field_names[4] = { "WiFi 名称", "WiFi 密码", "API 密钥", "知识库主题" };
 
 /* ---------- 主题 (0=明亮 1=护眼 2=夜间) ---------- */
 static int s_theme = 0;
@@ -588,12 +244,14 @@ static void theme_apply(int t)
         break;
     case 2:  /* 夜间: 黑底白字 */
         s_th_bg = 0x0000; s_th_fg = 0xFFFF; s_th_bar = 0x2104;
-        s_th_bar_fg = 0xFFFF; s_th_sel = 0x28A8; s_th_border = 0x6B6D;
+        s_th_bar_fg = 0xFFFF; s_th_sel = 0x28A8;
+        s_th_border = 0x8430;   /* 中灰: 0x6B6D 在黑底上对比度太低 */
         break;
     default: /* 明亮 */
         s_th_bg = 0xFFFF; s_th_fg = 0x0000; s_th_bar = 0x001F;
         s_th_bar_fg = 0xFFFF; s_th_sel = 0x5D7C; s_th_border = 0x8430;
     }
+    kb_set_theme(s_th_bg, s_th_fg, s_th_bar, s_th_bar_fg, s_th_sel, s_th_border);
 }
 
 /* ---------- 背光亮度 (LEDC PWM, 0-100) ---------- */
@@ -678,30 +336,22 @@ static void draw_small_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_
 {
     if (c < 0x20 || c > 0x7E) return;
     const uint8_t *g = s_font5x7[c - 0x20];
-    static uint8_t buf[5 * 7 * 2];          /* 大端直存 */
+    static uint16_t buf[35];               /* RGB565, gfx_push_pixels 转大端 */
     for (int row = 0; row < 7; row++)
-        for (int col = 0; col < 5; col++) {
-            uint16_t px = ((g[col] >> row) & 1) ? fg : bg;
-            buf[(row * 5 + col) * 2]     = px >> 8;
-            buf[(row * 5 + col) * 2 + 1] = px & 0xFF;
-        }
-    lcd_set_window(x, y, x + 4, y + 6);
-    gpio_set_level(PIN_CS, 0);
-    gpio_set_level(PIN_DC, 1);
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 5 * 7 * 16;
-    t.tx_buffer = buf;
-    spi_device_transmit(s_spi, &t);
-    gpio_set_level(PIN_CS, 1);
+        for (int col = 0; col < 5; col++)
+            buf[row * 5 + col] = ((g[col] >> row) & 1) ? fg : bg;
+    gfx_set_window(x, y, x + 4, y + 6);
+    gfx_push_pixels(buf, 35);
 }
 
 static void draw_small_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg)
 {
+    gfx_hold_begin();                      /* 连续小字符共享 CS */
     while (*s) {
         draw_small_char(x, y, *s++, fg, bg);
         x += 6;
     }
+    gfx_hold_end();
 }
 
 /* 返回键图形 (左箭头, 26x16) */
@@ -718,6 +368,8 @@ static void draw_ip_bar(int show_back)
 {
     if (show_back)
         draw_back_icon(452, 4);      /* 右上角, 避开中间标题/IP */
+    if (s_time_str[0])               /* SNTP 已同步: 顶栏时间 (240..330) */
+        draw_small_str(240, 4, s_time_str, s_th_bar_fg, s_th_bar);
     if (s_wifi_state == 2) {
         draw_small_str(330, 4, s_wifi_ip, s_th_bar_fg, s_th_bar);
     } else if (s_wifi_state == 1) {
@@ -731,12 +383,48 @@ static void draw_ip_bar(int show_back)
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_sntp.h"        /* 联网后 NTP 校时 */
+#include <time.h>
 
 #define MAX_AP 16
 static wifi_ap_record_t s_ap_list[MAX_AP];
 static int s_ap_count = 0;
 
 static uint32_t s_last_reconnect = 0;
+
+/* ---------- SNTP 校时 (联网后自动同步, 顶栏显示 MM-DD HH:MM) ---------- */
+static void time_sync_start(void)
+{
+    static int started = 0;
+    if (started)
+        return;
+    started = 1;
+    setenv("TZ", "CST-8", 1);          /* 中国时区 UTC+8, 无夏令时 */
+    tzset();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(NULL);
+    esp_sntp_init();
+    ESP_LOGI(TAG, "sntp started");
+}
+
+/* 刷新顶栏时间字符串 (仅在 SNTP 已同步后有效) */
+static void time_refresh(void)
+{
+    if (esp_sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED)
+        return;                        /* 未同步: 保持空白 */
+    time_t now;
+    time(&now);
+    struct tm *tm = localtime(&now);
+    if (!tm)
+        return;
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%02d-%02d %02d:%02d",
+             tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min);
+    strncpy(s_time_str, buf, sizeof(s_time_str) - 1);
+    s_time_str[sizeof(s_time_str) - 1] = 0;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -760,6 +448,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_wifi_state = 2;
         ESP_LOGI(TAG, "got ip %s", s_wifi_ip);
         http_server_start();               /* 连接成功自动开 HTTP 服务器 */
+        time_sync_start();                 /* 联网后 NTP 校时 */
     }
 }
 
@@ -915,9 +604,24 @@ static esp_err_t http_ai_test_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "aitest: topic='%s' heap=%lu", topic,
              (unsigned long)esp_get_free_heap_size());
     static char out[4300];          /* httpd 任务栈小, 用静态缓冲 */
+    if (strncmp(buf, "err", 3) == 0) {   /* 查最近一次 AI 错误 (诊断用, 免串口) */
+        snprintf(out, sizeof(out), "%s", ai_last_error());
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_send(req, out, strlen(out));
+    }
     if (strncmp(buf, "trans:", 6) == 0) {   /* 翻译测试: body=trans:拼音 */
-        const char *cn = ai_translate_topic(buf + 6);
+        const char *cn = ai_translate_topic("生物", buf + 6);
         snprintf(out, sizeof(out), "%.4000s", cn[0] ? cn : "(trans failed)");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_send(req, out, strlen(out));
+    }
+    if (strncmp(buf, "aiq:", 4) == 0) {   /* 出题测试: body=aiq:数学 (诊断用) */
+        int rc = ai_generate_question(buf[4] ? buf + 4 : "数学");
+        if (rc == 0 && g_ai_q.content && g_ai_q.content[0])
+            snprintf(out, sizeof(out), "OK [%s] %s",
+                     g_ai_q.is_choice == 1 ? "选择" : "填空", g_ai_q.content);
+        else
+            snprintf(out, sizeof(out), "FAIL: %s", ai_last_error());
         httpd_resp_set_type(req, "text/plain; charset=utf-8");
         return httpd_resp_send(req, out, strlen(out));
     }
@@ -975,8 +679,13 @@ static void settings_load(void)
             s_brightness = v;
         if (nvs_get_i32(h, "grade", &v) == ESP_OK && v >= 0 && v <= 2)
             s_grade = v;
+        if (nvs_get_i32(h, "diff", &v) == ESP_OK && v >= 0 && v <= 2)
+            s_diff = v;
+        if (nvs_get_i32(h, "fill", &v) == ESP_OK && v >= 0 && v <= 100)
+            s_fill_pct = v;
         nvs_close(h);
     }
+    /* 无内置 Key: NVS 无 Key 时保持空, AI 功能会提示先联网网页输入 */
     theme_apply(s_theme);
 }
 
@@ -990,144 +699,14 @@ static void settings_save(void)
         nvs_set_i32(h, "theme", s_theme);
         nvs_set_i32(h, "bright", s_brightness);
         nvs_set_i32(h, "grade", s_grade);
+        nvs_set_i32(h, "diff", s_diff);
+        nvs_set_i32(h, "fill", s_fill_pct);
         nvs_commit(h);
         nvs_close(h);
     }
 }
 
 /* ---------- 软键盘 ---------- */
-#define KB_Y0    46            /* 键盘区起始 y */
-#define KB_H     40            /* 键高 */
-#define KB_W     48            /* 键宽 (10 列) */
-
-static int s_kb_field = 0;     /* 0=SSID 1=密码 2=API Key 3=知识库主题 */
-static int s_kb_shift = 0;
-static int s_kb_sym = 0;       /* 符号页 */
-static char s_kb_buf[80];
-static char s_kb_custom[40] = "";   /* 知识库自定义主题名 */
-
-static const char *s_field_names[4] = { "WiFi 名称", "WiFi 密码", "API 密钥", "知识库主题" };
-
-/* 键盘主布局 (行 x 10 列) */
-static const char kb_main[5][10] = {
-    {'1','2','3','4','5','6','7','8','9','0'},
-    {'q','w','e','r','t','y','u','i','o','p'},
-    {'a','s','d','f','g','h','j','k','l','\x03'},   /* 退格 */
-    {'\x01','z','x','c','v','b','n','m','\x02','\x02'}, /* shift, zxcvbnm, 完成(2列) */
-    {'\x04','\x04','\x04','\x04','\x04','\x04','\x04','\x04','\x05','\x05'}, /* 空格(8), 符号(2) */
-};
-/* 符号布局 */
-static const char kb_sym[5][10] = {
-    {'~','!','@','#','$','%','^','&','*','('},
-    {')','-','_','=','+','[',']','{','}','|'},
-    {'\\',';',':','\'','"',',','.','<','>','\x03'},
-    {'/','?','`','\x06','\x02','\x02','\x02','\x02','\x02','\x02'},  /* 返回, 完成 */
-    {'\x04','\x04','\x04','\x04','\x04','\x04','\x04','\x04','\x05','\x05'},
-};
-/* 功能码: 0x01=shift 0x02=完成 0x03=退格 0x04=空格 0x05=符号页 0x06=返回 */
-
-static void draw_keyboard(void)
-{
-    lcd_clear(s_th_bg);
-    lcd_fill_rect(0, 0, 479, 26, s_th_bar);
-    char top[72];
-    snprintf(top, sizeof(top), "%s  (%d)", s_field_names[s_kb_field], s_kb_field + 1);
-    lcd_draw_text(8, 5, top, s_th_bar_fg, s_th_bar);
-    lcd_draw_text(340, 5, "完成保存", s_th_bar_fg, s_th_bar);
-
-    /* 输入显示 (超长显示末尾) */
-    lcd_draw_rect(6, 30, 474, 44, s_th_border);
-    int blen = strlen(s_kb_buf);
-    const char *disp = s_kb_buf;
-    if (blen > 28)
-        disp = s_kb_buf + blen - 28;
-    lcd_draw_text(10, 31, disp, s_th_fg, s_th_bg);
-
-    const char (*kb)[10] = s_kb_sym ? kb_sym : kb_main;
-    for (int r = 0; r < 5; r++) {
-        for (int c = 0; c < 10; c++) {
-            char k = kb[r][c];
-            int dup = (c > 0 && kb[r][c - 1] == k);   /* 宽键重复列 */
-            int x = c * KB_W, y = KB_Y0 + r * KB_H;
-            uint16_t bg = s_th_bg, fg = BLACK;
-            if (k < 0x20) { bg = s_th_sel; fg = 0x0000; }
-            lcd_fill_rect(x + 2, y + 2, x + KB_W - 2, y + KB_H - 2, bg);
-            lcd_draw_rect(x + 2, y + 2, x + KB_W - 2, y + KB_H - 2, s_th_border);
-            if (dup)
-                continue;                              /* 宽键 label 只画一次 */
-            if (k >= 0x20) {
-                char ch = (s_kb_shift && k >= 'a' && k <= 'z') ? k - 'a' + 'A' : k;
-                lcd_draw_char(x + (KB_W - 14) / 2, y + 10, ch, fg, bg);
-            } else if (k == 0x01) {                    /* shift: 激活高亮 */
-                if (s_kb_shift) {
-                    lcd_fill_rect(x + 2, y + 2, x + KB_W - 2, y + KB_H - 2, s_th_sel);
-                    lcd_draw_rect(x + 2, y + 2, x + KB_W - 2, y + KB_H - 2, s_th_bar);
-                }
-                lcd_draw_char(x + (KB_W - 14) / 2, y + 10, '^', BLACK, s_kb_shift ? s_th_sel : s_th_sel);
-            } else if (k == 0x02) {                    /* 完成 (2 列宽, 居中) */
-                text_center2(x + KB_W, y + 12, "OK", fg, bg);
-            } else if (k == 0x03) {                    /* 退格 */
-                lcd_draw_char(x + (KB_W - 14) / 2, y + 10, '<', fg, bg);
-            } else if (k == 0x04) {                    /* 空格 (8 列宽, 居中) */
-                text_center2(x + KB_W * 8 / 2, y + 12, "SPC", fg, bg);
-            } else if (k == 0x05) {                    /* 符号页 */
-                lcd_draw_char(x + (KB_W - 14) / 2, y + 10, '#', fg, bg);
-            } else if (k == 0x06) {                    /* 返回 */
-                lcd_draw_char(x + (KB_W - 14) / 2, y + 10, '<', fg, bg);
-            }
-        }
-    }
-}
-
-/* 触摸键盘: 返回 1=输入框变(局部刷新) 2=完成 3=shift变(刷输入框+shift键) 4=键盘页切换(全重绘) */
-static int kb_touch(int sx, int sy)
-{
-    if (sy < KB_Y0) return 0;
-    int r = (sy - KB_Y0) / KB_H;
-    int c = sx / KB_W;
-    if (r < 0 || r > 4 || c < 0 || c > 9) return 0;
-    const char (*kb)[10] = s_kb_sym ? kb_sym : kb_main;
-    char k = kb[r][c];
-    int len = strlen(s_kb_buf);
-    if (k >= 0x20) {
-        char ch = (s_kb_shift && k >= 'a' && k <= 'z') ? k - 'a' + 'A' : k;
-        if (len < (int)sizeof(s_kb_buf) - 1) {
-            s_kb_buf[len] = ch;
-            s_kb_buf[len + 1] = 0;
-        }
-        s_kb_shift = 0;
-        return 3;
-    }
-    switch (k) {
-    case 0x01: s_kb_shift = !s_kb_shift; return 3;
-    case 0x03: if (len) s_kb_buf[len - 1] = 0; return 1;
-    case 0x04: if (len < (int)sizeof(s_kb_buf) - 1) { s_kb_buf[len] = ' '; s_kb_buf[len+1] = 0; } return 1;
-    case 0x05: s_kb_sym = !s_kb_sym; return 4;
-    case 0x06: s_kb_sym = 0; s_kb_shift = 0; return 4;
-    case 0x02:  /* 完成: 保存到设置项 */
-        if (s_kb_field == 0) {
-            strncpy(s_wifi_ssid, s_kb_buf, sizeof(s_wifi_ssid) - 1);
-            s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = 0;
-        } else if (s_kb_field == 1) {
-            strncpy(s_wifi_pass, s_kb_buf, sizeof(s_wifi_pass) - 1);
-            s_wifi_pass[sizeof(s_wifi_pass) - 1] = 0;
-        } else if (s_kb_field == 2) {
-            strncpy(s_api_key, s_kb_buf, sizeof(s_api_key) - 1);
-            s_api_key[sizeof(s_api_key) - 1] = 0;
-        } else {
-            strncpy(s_kb_custom, s_kb_buf, sizeof(s_kb_custom) - 1);
-            s_kb_custom[sizeof(s_kb_custom) - 1] = 0;
-        }
-        settings_save();
-        s_kb_sym = 0;
-        s_kb_shift = 0;
-        if (s_kb_field == 1)             /* 密码完成: 触发 WiFi 连接 */
-            wifi_connect_now();
-        return 2;
-    }
-    return 0;
-}
-
 static void draw_settings(void)
 {
     static const char *tnames[3] = { "明亮", "护眼", "夜间" };
@@ -1137,52 +716,76 @@ static void draw_settings(void)
     lcd_draw_text(8, 5, "设置", s_th_bar_fg, s_th_bar);
     draw_ip_bar(1);
 
-    /* 3 项: WiFi 名 / 密码 / API (紧凑布局) */
+    /* 4 项: WiFi 名 / 密码 / API / 填空比例 (紧凑布局) */
     const char *vals[3] = { s_wifi_ssid, s_wifi_pass, s_api_key };
-    for (int i = 0; i < 3; i++) {
-        int y = 34 + i * 40;
-        lcd_draw_rect(10, y, 470, y + 36, s_th_border);
+    for (int i = 0; i < 4; i++) {
+        int y = 30 + i * 30;
+        lcd_draw_rect(10, y, 470, y + 28, s_th_border);
+        if (i == 3) {                   /* 填空比例: 左减右加 */
+            lcd_draw_text(20, y + 2, "填空比例", s_th_fg, s_th_bg);
+            char fb[32];
+            snprintf(fb, sizeof(fb), "%d%%", s_fill_pct);
+            lcd_draw_text(20, y + 15, fb, s_th_border, s_th_bg);
+            lcd_draw_text(380, y + 15, "[左减右加]", s_th_bar, s_th_bg);
+            continue;
+        }
         lcd_draw_text(20, y + 2, s_field_names[i], s_th_fg, s_th_bg);
         char vbuf[80];
         if (i == 1 && s_wifi_pass[0])
             snprintf(vbuf, sizeof(vbuf), "%s", "******");
         else
             snprintf(vbuf, sizeof(vbuf), "%s", vals[i]);
-        lcd_draw_text(20, y + 19, vbuf[0] ? vbuf : "(未设置)", s_th_border, s_th_bg);
-        lcd_draw_text(400, y + 19, i == 2 ? "网页输入" : "编辑", s_th_fg, s_th_bg);
+        lcd_draw_text(20, y + 15, vbuf[0] ? vbuf : "(未设置)", s_th_border, s_th_bg);
+        lcd_draw_text(400, y + 15, i == 2 ? "网页输入" : "编辑", s_th_fg, s_th_bg);
     }
 
     /* 主题 (点击切换) */
-    int ty = 158;
-    lcd_draw_rect(10, ty, 470, ty + 26, s_th_border);
-    lcd_draw_text(20, ty + 5, "主题", s_th_fg, s_th_bg);
+    int ty = 154;
+    lcd_draw_rect(10, ty, 470, ty + 22, s_th_border);
+    lcd_draw_text(20, ty + 3, "主题", s_th_fg, s_th_bg);
     char tbuf[40];
     snprintf(tbuf, sizeof(tbuf), "%s (点击切换)", tnames[s_theme]);
-    lcd_draw_text(130, ty + 5, tbuf, s_th_bar, s_th_bg);
+    lcd_draw_text(130, ty + 3, tbuf, s_th_bar, s_th_bg);
 
     /* 亮度 (左减右加) */
-    int by = 188;
-    lcd_draw_rect(10, by, 470, by + 26, s_th_border);
-    lcd_draw_text(20, by + 5, "亮度", s_th_fg, s_th_bg);
+    int by = 178;
+    lcd_draw_rect(10, by, 470, by + 22, s_th_border);
+    lcd_draw_text(20, by + 3, "亮度", s_th_fg, s_th_bg);
     char bbuf[32];
     snprintf(bbuf, sizeof(bbuf), "%d%%", s_brightness);
-    lcd_draw_text(120, by + 5, bbuf, s_th_fg, s_th_bg);
-    lcd_draw_text(280, by + 5, "[左半减]", s_th_border, s_th_bg);
-    lcd_draw_text(400, by + 5, "[右半加]", s_th_bar, s_th_bg);
+    lcd_draw_text(120, by + 3, bbuf, s_th_fg, s_th_bg);
+    lcd_draw_text(280, by + 3, "[左半减]", s_th_border, s_th_bg);
+    lcd_draw_text(400, by + 3, "[右半加]", s_th_bar, s_th_bg);
 
-    /* 年级 (点击切换) */
-    int gy = 218;
-    lcd_draw_rect(10, gy, 470, gy + 24, s_th_border);
-    lcd_draw_text(20, gy + 4, "年级", s_th_fg, s_th_bg);
+    /* 年级 / 难度 (点击切换: 左半=年级, 右半=难度) */
+    int gy = 202;
+    lcd_draw_rect(10, gy, 470, gy + 22, s_th_border);
+    lcd_draw_text(20, gy + 3, "年级", s_th_fg, s_th_bg);
     char gbuf[40];
-    snprintf(gbuf, sizeof(gbuf), "%s (点击切换)", s_grade_names[s_grade]);
-    lcd_draw_text(130, gy + 4, gbuf, s_th_bar, s_th_bg);
+    snprintf(gbuf, sizeof(gbuf), "%s", s_grade_names[s_grade]);
+    lcd_draw_text(110, gy + 3, gbuf, s_th_bar, s_th_bg);
+    lcd_draw_text(250, gy + 3, "难度", s_th_fg, s_th_bg);
+    char dbuf[40];
+    snprintf(dbuf, sizeof(dbuf), "%s", s_diff_names[s_diff]);
+    lcd_draw_text(310, gy + 3, dbuf, s_th_bar, s_th_bg);
+    lcd_draw_text(390, gy + 3, "点击切换", s_th_border, s_th_bg);
+
+    /* 存储空间: 知识库剩余 + 收藏占用 (只读显示) */
+    int sy = 226;
+    lcd_draw_rect(10, sy, 470, sy + 18, s_th_border);
+    char sbuf[80];
+    int kb_remain = 0;
+    for (int i = 0; i < 9; i++)
+        kb_remain += weak_kb_remain_bytes(i);
+    snprintf(sbuf, sizeof(sbuf), "存储: 知识库余 %dKB · 收藏 %d/256", 
+             kb_remain / 1024, fav_count());
+    lcd_draw_text(20, sy + 2, sbuf, s_th_border, s_th_bg);
 
     /* 底部按钮: 扫描 WiFi / 手动输入 */
-    lcd_draw_rect(10, 244, 235, 264, s_th_bar);
-    text_center2(122, 248, "扫描 WiFi", s_th_bar_fg, s_th_bar);
-    lcd_draw_rect(245, 244, 470, 264, s_th_border);
-    text_center2(357, 248, "手动输入", s_th_fg, s_th_bg);
+    lcd_draw_rect(10, 248, 235, 268, s_th_bar);
+    text_center2(122, 252, "扫描 WiFi", s_th_bar_fg, s_th_bar);
+    lcd_draw_rect(245, 248, 470, 268, s_th_border);
+    text_center2(357, 252, "手动输入", s_th_fg, s_th_bg);
 }
 
 /* API Key 网页输入页 */
@@ -1238,20 +841,6 @@ static void draw_ap_list(void)
         text_center(254, "点选 WiFi 输入密码", s_th_border, s_th_bg);
 }
 
-/* ---------- 文本工具 ---------- */
-static int text_width(const char *s)
-{
-    int w = 0;
-    while (*s) {
-        uint8_t c = *s;
-        if (c < 0x80) { w += 17; s++; }
-        else if ((c & 0xE0) == 0xC0) { w += 17; s += 2; }
-        else if ((c & 0xF0) == 0xE0) { w += 17; s += 3; }
-        else s++;
-    }
-    return w;
-}
-
 static void text_center(int y, const char *s, uint16_t fg, uint16_t bg)
 {
     lcd_draw_text((LCD_WIDTH - text_width(s)) / 2, y, s, fg, bg);
@@ -1276,9 +865,10 @@ static int text_wrap_skip(int x, int y, const char *s, uint16_t fg, uint16_t bg,
 {
     int cx = x, cy = y, cur_line = 1, lines = 1;
     int count_only = (y < 0);              /* y<0: 只统计行数不绘制 */
+    gfx_hold_begin();                      /* 整页文本共享一次 CS 拉低 */
     while (*s) {
         uint8_t c = *s;
-        int w = 17;                        /* ASCII 与中文同宽步进 */
+        int w = (c < 0x80) ? r_char_adv16((char)c) : 17;   /* ASCII 用灰度实际宽度 */
 
         /* 逐字换行 (中英文统一) */
         if (cx + w > x + max_w && cx > x) {
@@ -1300,17 +890,17 @@ static int text_wrap_skip(int x, int y, const char *s, uint16_t fg, uint16_t bg,
         int in_view = (cur_line > skip_lines && cur_line <= skip_lines + max_lines);
         if (!count_only && in_view) {
             if (c < 0x80) {
-                lcd_draw_char(cx, cy, c, fg, bg);
-                cx += 17;   /* 与 ASCII 步进一致 (曾漏改, 导致字符重叠右半被覆盖) */
+                r_draw_char_gray16(cx, cy, (char)c, fg, bg);   /* Arial 灰度抗锯齿 */
+                cx += w;
                 s++;
             } else if ((c & 0xE0) == 0xC0) {
                 uint16_t code = ((c & 0x1F) << 6) | (s[1] & 0x3F);
-                lcd_draw_cn_char(cx, cy, code, fg, bg);
+                r_draw_char_code(cx, cy, code, fg, bg);   /* 符号优先, 回退中文 */
                 cx += 17;
                 s += 2;
             } else if ((c & 0xF0) == 0xE0) {
                 uint16_t code = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-                lcd_draw_cn_char(cx, cy, code, fg, bg);
+                r_draw_char_code(cx, cy, code, fg, bg);   /* 符号优先, 回退中文 */
                 cx += 17;
                 s += 3;
             } else {
@@ -1319,7 +909,7 @@ static int text_wrap_skip(int x, int y, const char *s, uint16_t fg, uint16_t bg,
         } else {
             /* 不画, 只推进宽度以保持换行计算 */
             if (c < 0x80) {
-                cx += 17;
+                cx += w;
                 s++;
             } else if ((c & 0xE0) == 0xC0) {
                 cx += 17;
@@ -1332,6 +922,7 @@ static int text_wrap_skip(int x, int y, const char *s, uint16_t fg, uint16_t bg,
             }
         }
     }
+    gfx_hold_end();
     if (p_total) *p_total = lines;
     return lines;
 }
@@ -1343,7 +934,7 @@ static void draw_menu(void)
 {
     lcd_clear(s_th_bg);
     lcd_fill_rect(0, 0, 479, 30, s_th_bar);
-    text_center(6, "高中刷题机", s_th_bar_fg, s_th_bar);
+    lcd_draw_text(8, 6, "高中刷题机", s_th_bar_fg, s_th_bar);  /* 左对齐, 给顶栏时间留位 */
     draw_ip_bar(0);
 
     /* 统计 (顶部) */
@@ -1399,7 +990,16 @@ static void draw_weak_subject(void)      /* 选科 */
     }
 }
 
-static void draw_weak_page(void)         /* 该科薄弱点页 */
+static void draw_weak_page_body(void);   /* 前置声明 (定义在下方) */
+
+/* 错题显示序 → 存储索引: 列表最新在前 (i=0 显示最新一道) */
+static int weak_show_idx(int i)
+{
+    int n = weak_count(s_weak_subj);
+    return n - 1 - i;
+}
+
+static void draw_weak_page(void)         /* 该科薄弱点页 (首次进入: 全屏) */
 {
     lcd_clear(s_th_bg);
     lcd_fill_rect(0, 0, 479, 26, s_th_bar);
@@ -1407,6 +1007,13 @@ static void draw_weak_page(void)         /* 该科薄弱点页 */
     snprintf(t, sizeof(t), "薄弱点: %s", s_subjects[s_weak_subj]);
     lcd_draw_text(8, 5, t, s_th_bar_fg, s_th_bar);
     draw_ip_bar(1);
+    draw_weak_page_body();
+}
+
+/* 翻页/局部刷新: 只清内容区 (27..271), 顶栏保留 */
+static void draw_weak_page_body(void)
+{
+    lcd_fill_rect(0, 27, 479, 271, s_th_bg);
 
     int n = weak_count(s_weak_subj);
     int per = 4;                              /* 每页 4 条错题 */
@@ -1420,13 +1027,13 @@ static void draw_weak_page(void)         /* 该科薄弱点页 */
         snprintf(cnt, sizeof(cnt), "错题 %d 题", n);
     lcd_draw_text(8, 30, cnt, s_th_fg, s_th_bg);
 
-    /* 错题列表 (每页 4 条; 多页时左右半屏翻页) */
+    /* 错题列表 (每页 4 条; 多页时左右半屏翻页; 最新在前) */
     int ly = 46;
-    for (int i = s_weak_list_page * per; i < n && i < s_weak_list_page * per + per; i++) {
+    for (int r = s_weak_list_page * per; r < n && r < s_weak_list_page * per + per; r++) {
         char tt[130];
-        if (weak_get_wrong(s_weak_subj, i, tt, sizeof(tt)) == 0) {
+        if (weak_get_wrong(s_weak_subj, weak_show_idx(r), tt, sizeof(tt)) == 0) {
             char line[160];
-            snprintf(line, sizeof(line), "%d. %s", i + 1, tt);
+            snprintf(line, sizeof(line), "%d. %s", r + 1, tt);   /* 行号=显示序 (1=最新) */
             int bl = strlen(line), px = 0, cut = 0;
             for (int j = 0; j < bl && px < 430; ) {
                 uint8_t ch = (uint8_t)line[j];
@@ -1506,13 +1113,13 @@ static void weak_ai_run(void)            /* 旧入口: 全部错题 (最多 5 �
 {
     char topics[1000] = "";
     int n = weak_count(s_weak_subj);
-    for (int i = 0; i < n && i < 5; i++) {
+    for (int i = 0; i < n && i < 5; i++) {           /* 最新在前 */
         char t[130];
-        if (weak_get_wrong(s_weak_subj, i, t, sizeof(t)) == 0) {
-            if (strlen(topics) + strlen(t) + 2 < sizeof(topics)) {
-                strcat(topics, t);
-                strcat(topics, "；");
-            }
+        if (weak_get_wrong(s_weak_subj, weak_show_idx(i), t, sizeof(t)) == 0) {
+            char one[160];
+            snprintf(one, sizeof(one), "%d.%s；", i + 1, t);
+            if (strlen(topics) + strlen(one) < sizeof(topics))
+                strcat(topics, one);
         }
     }
     weak_ai_do(topics);
@@ -1521,8 +1128,20 @@ static void weak_ai_run(void)            /* 旧入口: 全部错题 (最多 5 �
 /* ---------- 薄弱点: 逐题选择分析 ---------- */
 static uint8_t s_sel_wrong[20];
 static int s_sel_page = 0;
+static int s_sel_warn = 0;   /* "请先勾选"提示页: 点击任意处返回 */
 
-static void draw_weak_select(void)      /* 选题页: 复选框 + 翻页 + 底部按钮 */
+/* ---------- 收藏: AI 选题分析 (勾选 ≤5 题, 结果全屏翻页) ---------- */
+static uint8_t s_sel_fav[64];
+static int s_sel_fav_page = 0;
+/* 分析结果指针: 指向 ai_analyze_weakness 的静态缓冲 (结果页停留期间
+ * 无 AI 调用不会覆盖; 不复制, 省 8KB BSS — ESP32 静态内存紧张) */
+static const char *s_fav_ai_ptr = "";
+
+static void redraw_sel_row(int i);
+static void redraw_sel_count(void);
+static void draw_weak_select_body(void);
+
+static void draw_weak_select(void)      /* 选题页: 复选框 + 翻页 + 底部按钮 (首次进入: 全屏) */
 {
     lcd_clear(s_th_bg);
     lcd_fill_rect(0, 0, 479, 26, s_th_bar);
@@ -1530,46 +1149,23 @@ static void draw_weak_select(void)      /* 选题页: 复选框 + 翻页 + 底�
     snprintf(t, sizeof(t), "选题分析: %s", s_subjects[s_weak_subj]);
     lcd_draw_text(8, 5, t, s_th_bar_fg, s_th_bar);
     draw_ip_bar(1);
+    draw_weak_select_body();
+}
+
+/* 局部刷新: 只清内容区 (顶栏保留) */
+static void draw_weak_select_body(void)
+{
+    lcd_fill_rect(0, 27, 479, 271, s_th_bg);
 
     int n = weak_count(s_weak_subj);
     int per = 4;
     int total_pages = (n + per - 1) / per;
     if (total_pages < 1) total_pages = 1;
     if (s_sel_page >= total_pages) s_sel_page = total_pages - 1;
-    int sel = 0;
-    for (int i = 0; i < n && i < 20; i++)
-        if (s_sel_wrong[i]) sel++;
-    char cnt[40];
-    snprintf(cnt, sizeof(cnt), "已选 %d/%d 题  点行勾选", sel, n);
-    lcd_draw_text(8, 30, cnt, s_th_fg, s_th_bg);
-
+    redraw_sel_count();
     int ly = 48;
     for (int i = s_sel_page * per; i < n && i < s_sel_page * per + per; i++) {
-        int cbx = 16, cby = ly + 1;
-        lcd_draw_rect(cbx, cby, cbx + 22, cby + 22,
-                      s_sel_wrong[i] ? s_th_bar : s_th_border);
-        if (s_sel_wrong[i])
-            text_center2(cbx + 11, cby + 2, "√", s_th_bar_fg, s_th_bg);
-        char line[160];
-        snprintf(line, sizeof(line), "%d. %s", i + 1, "");
-        char tt[130];
-        if (weak_get_wrong(s_weak_subj, i, tt, sizeof(tt)) == 0) {
-            snprintf(line, sizeof(line), "%d. %s", i + 1, tt);
-        }
-        int bl = strlen(line), px = 0, cut = 0;
-        for (int j = 0; j < bl && px < 400; ) {
-            uint8_t ch = (uint8_t)line[j];
-            if (ch < 0x80) { px += 17; j++; }
-            else if ((ch & 0xE0) == 0xC0) { px += 17; j += 2; }
-            else if ((ch & 0xF0) == 0xE0) { px += 17; j += 3; }
-            else j++;
-            cut = j;
-        }
-        if (cut < bl) {
-            line[cut] = 0;
-            strcat(line, "...");
-        }
-        lcd_draw_text(50, ly, line, s_th_fg, s_th_bg);
+        redraw_sel_row(i);
         ly += 32;
     }
     if (n == 0)
@@ -1584,6 +1180,55 @@ static void draw_weak_select(void)      /* 选题页: 复选框 + 翻页 + 底�
     text_center2(235, 244, "分析选中", s_th_bar_fg, s_th_bar);
     lcd_draw_rect(314, 240, 470, 262, s_th_border);
     text_center2(392, 244, "返回", s_th_fg, s_th_bg);
+}
+
+/* 局部重画单个勾选行 (勾选切换时用, 避免整屏闪烁) */
+static void redraw_sel_row(int i)
+{
+    int row = i - s_sel_page * 4;
+    if (row < 0 || row >= 4)
+        return;
+    int ly = 48 + row * 32;
+    int cbx = 16, cby = ly + 1;
+    lcd_fill_rect(cbx, cby, cbx + 22, cby + 22, s_th_bg);      /* 先清框内 */
+    lcd_draw_rect(cbx, cby, cbx + 22, cby + 22,
+                  s_sel_wrong[i] ? s_th_bar : s_th_border);
+    if (s_sel_wrong[i])
+        text_center2(cbx + 11, cby + 2, "√", s_th_bar_fg, s_th_bg);
+    char line[160];
+    char tt[130];
+    if (weak_get_wrong(s_weak_subj, weak_show_idx(i), tt, sizeof(tt)) == 0)
+        snprintf(line, sizeof(line), "%d. %s", i + 1, tt);
+    else
+        snprintf(line, sizeof(line), "%d.", i + 1);
+    int bl = strlen(line), px = 0, cut = 0;
+    for (int j = 0; j < bl && px < 400; ) {
+        uint8_t ch = (uint8_t)line[j];
+        if (ch < 0x80) { px += 17; j++; }
+        else if ((ch & 0xE0) == 0xC0) { px += 17; j += 2; }
+        else if ((ch & 0xF0) == 0xE0) { px += 17; j += 3; }
+        else j++;
+        cut = j;
+    }
+    if (cut < bl) {
+        line[cut] = 0;
+        strcat(line, "...");
+    }
+    lcd_fill_rect(50, ly, 470, ly + 16, s_th_bg);              /* 清行文字区 */
+    lcd_draw_text(50, ly, line, s_th_fg, s_th_bg);
+}
+
+/* 局部刷新顶部"已选 x/y"计数行 */
+static void redraw_sel_count(void)
+{
+    int n = weak_count(s_weak_subj);
+    int sel = 0;
+    for (int i = 0; i < n && i < 20; i++)
+        if (s_sel_wrong[i]) sel++;
+    char cnt[48];
+    snprintf(cnt, sizeof(cnt), "已选 %d/%d 题  最多5题", sel, n);
+    lcd_fill_rect(0, 27, 479, 45, s_th_bg);
+    lcd_draw_text(8, 30, cnt, s_th_fg, s_th_bg);
 }
 
 /* 收藏夹列表页 */
@@ -1634,15 +1279,18 @@ static void draw_fav_list(void)
     if (n == 0)
         text_center(130, "还没有收藏题目", s_th_border, s_th_bg);
 
-    if (total_pages > 1) {                    /* 多页: 底部翻页按钮 */
-        lcd_draw_rect(10, 230, 156, 264, s_th_border);
-        text_center2(83, 234, "< 上页", s_fav_page > 0 ? s_th_fg : s_th_border, s_th_bg);
-        lcd_draw_rect(162, 230, 308, 264, s_th_border);
+    /* 底部: [AI 分析] (常驻) + 翻页按钮 (多页时) */
+    lcd_draw_rect(10, 230, 130, 264, s_th_bar);
+    text_center2(70, 234, "AI 分析", s_th_bar_fg, s_th_bar);
+    if (total_pages > 1) {
+        lcd_draw_rect(136, 230, 232, 264, s_th_border);
+        text_center2(184, 234, "< 上页", s_fav_page > 0 ? s_th_fg : s_th_border, s_th_bg);
+        lcd_draw_rect(238, 230, 334, 264, s_th_border);
         char pg[24];
         snprintf(pg, sizeof(pg), "%d/%d", s_fav_page + 1, total_pages);
-        text_center2(235, 234, pg, s_th_fg, s_th_bg);
-        lcd_draw_rect(314, 230, 470, 264, s_th_border);
-        text_center2(392, 234, "下页 >", s_fav_page + 1 < total_pages ? s_th_fg : s_th_border, s_th_bg);
+        text_center2(286, 234, pg, s_th_fg, s_th_bg);
+        lcd_draw_rect(340, 230, 470, 264, s_th_border);
+        text_center2(405, 234, "下页 >", s_fav_page + 1 < total_pages ? s_th_fg : s_th_border, s_th_bg);
     } else {
         text_center(254, "点行查看 · 右侧移除", s_th_border, s_th_bg);
     }
@@ -1651,6 +1299,167 @@ static void draw_fav_list(void)
 static void text_center2(int cx, int y, const char *s, uint16_t fg, uint16_t bg)
 {
     lcd_draw_text(cx - text_width(s) / 2, y, s, fg, bg);
+}
+
+/* 按 16px 字体像素宽截断 UTF-8 串 (CJK≈17px, ASCII≈8px); 截断时尾部加 "..".
+ * src 与 dst 可同一缓冲 (就地截断) */
+static void trunc_px(const char *src, char *dst, int dstsz, int maxpx)
+{
+    int px = 0, j = 0;
+    while (src[j] && j < dstsz - 8) {
+        uint8_t ch = (uint8_t)src[j];
+        int cl = (ch < 0x80) ? 1 : ((ch & 0xE0) == 0xC0) ? 2 :
+                 ((ch & 0xF0) == 0xE0) ? 3 : ((ch & 0xF8) == 0xF0) ? 4 : 1;
+        int w = (ch < 0x80) ? 8 : 17;
+        if (px + w > maxpx)
+            break;
+        memmove(dst + j, src + j, (size_t)cl);
+        j += cl;
+        px += w;
+    }
+    int truncated = (src[j] != 0);
+    dst[j] = 0;
+    if (truncated) {
+        int tl = (int)strlen(dst);
+        if (tl + 3 < dstsz)
+            strcat(dst, "..");
+    }
+}
+
+/* ---------- 收藏: AI 选题分析 ---------- */
+static void draw_page_chrome(const char *title, int page, int total_pages); /* 定义在下方 */
+static void draw_fav_select_body(void);
+static void redraw_fav_row(int i);
+static void redraw_fav_count(void);
+static void draw_fav_ai_result(void);
+
+static void draw_fav_select(void)      /* 选题页 (首次进入: 全屏) */
+{
+    lcd_clear(s_th_bg);
+    lcd_fill_rect(0, 0, 479, 26, s_th_bar);
+    lcd_draw_text(8, 5, "收藏分析: 勾选题", s_th_bar_fg, s_th_bar);
+    draw_ip_bar(1);
+    draw_fav_select_body();
+}
+
+static void draw_fav_select_body(void)
+{
+    lcd_fill_rect(0, 27, 479, 271, s_th_bg);
+
+    int n = fav_count();
+    int per = 4;
+    int total_pages = (n + per - 1) / per;
+    if (total_pages < 1) total_pages = 1;
+    if (s_sel_fav_page >= total_pages) s_sel_fav_page = total_pages - 1;
+    redraw_fav_count();
+    int ly = 48;
+    for (int i = s_sel_fav_page * per; i < n && i < s_sel_fav_page * per + per; i++) {
+        redraw_fav_row(i);
+        ly += 32;
+    }
+    if (n == 0)
+        lcd_draw_text(8, ly, "(暂无收藏)", s_th_border, s_th_bg);
+    else if (total_pages > 1)
+        lcd_draw_text(8, ly, "左翻上页 右翻下页", s_th_border, s_th_bg);
+
+    /* 底部: [全选/清空] [分析选中] [返回] */
+    lcd_draw_rect(10, 240, 156, 262, s_th_border);
+    text_center2(83, 244, "全选/清空", s_th_fg, s_th_bg);
+    lcd_draw_rect(162, 240, 308, 262, s_th_bar);
+    text_center2(235, 244, "分析选中", s_th_bar_fg, s_th_bar);
+    lcd_draw_rect(314, 240, 470, 262, s_th_border);
+    text_center2(392, 244, "返回", s_th_fg, s_th_bg);
+}
+
+/* 局部重画单个勾选行 (收藏题) */
+static void redraw_fav_row(int i)
+{
+    int row = i - s_sel_fav_page * 4;
+    if (row < 0 || row >= 4)
+        return;
+    int ly = 48 + row * 32;
+    int cbx = 16, cby = ly + 1;
+    lcd_fill_rect(cbx, cby, cbx + 22, cby + 22, s_th_bg);
+    lcd_draw_rect(cbx, cby, cbx + 22, cby + 22,
+                  s_sel_fav[i] ? s_th_bar : s_th_border);
+    if (s_sel_fav[i])
+        text_center2(cbx + 11, cby + 2, "√", s_th_bar_fg, s_th_bg);
+    char line[160];
+    if (fav_get(i) == 0)
+        snprintf(line, sizeof(line), "%d.[%s] %s", i + 1,
+                 g_fav_q.subject ? g_fav_q.subject : "?", g_fav_q.content);
+    else
+        snprintf(line, sizeof(line), "%d.", i + 1);
+    int bl = strlen(line), px = 0, cut = 0;
+    for (int j = 0; j < bl && px < 370; ) {
+        uint8_t ch = (uint8_t)line[j];
+        if (ch < 0x80) { px += 17; j++; }
+        else if ((ch & 0xE0) == 0xC0) { px += 17; j += 2; }
+        else if ((ch & 0xF0) == 0xE0) { px += 17; j += 3; }
+        else j++;
+        cut = j;
+    }
+    if (cut < bl) {
+        line[cut] = 0;
+        strcat(line, "...");
+    }
+    lcd_fill_rect(50, ly, 470, ly + 16, s_th_bg);
+    lcd_draw_text(50, ly, line, s_th_fg, s_th_bg);
+}
+
+static void redraw_fav_count(void)
+{
+    int n = fav_count();
+    int sel = 0;
+    for (int i = 0; i < n && i < 64; i++)
+        if (s_sel_fav[i]) sel++;
+    char cnt[48];
+    snprintf(cnt, sizeof(cnt), "已选 %d/%d 题  最多5题", sel, n);
+    lcd_fill_rect(0, 27, 479, 45, s_th_bg);
+    lcd_draw_text(8, 30, cnt, s_th_fg, s_th_bg);
+}
+
+/* 执行收藏 AI 分析 (阻塞): 结果存 s_fav_ai_buf 供结果页翻页 */
+static void fav_ai_do(const char *subj, const char *topics)
+{
+    ESP_LOGI(TAG, "fav ai run: wifi=%d subj=%s", s_wifi_state, subj);
+    if (s_wifi_state != 2) {
+        lcd_clear(s_th_bg);
+        text_center(100, "请先连接 WiFi", RED, s_th_bg);
+        text_center(130, "点击返回", s_th_border, s_th_bg);
+        s_state = 22;
+        return;
+    }
+    lcd_clear(s_th_bg);
+    text_center(110, "AI 分析中... (最长60秒)", s_th_fg, s_th_bg);
+    const char *ai = ai_analyze_weakness(subj,
+                     topics[0] ? topics : "暂无具体题目内容，请给出学习建议");
+    if (ai[0]) {
+        s_fav_ai_ptr = ai;           /* 指向静态结果缓冲, 结果页期间不会被覆盖 */
+        s_wpage = 0;
+        s_state = 23;
+        draw_fav_ai_result();
+    } else {
+        lcd_clear(s_th_bg);
+        text_center(100, "AI 分析失败", RED, s_th_bg);
+        text_center(130, "检查网络 / API Key", s_th_border, s_th_bg);
+        text_center(150, "点击返回", s_th_border, s_th_bg);
+        s_state = 22;
+    }
+}
+
+/* 收藏 AI 分析结果页 (可翻页, 底部 [返回收藏]) */
+static void draw_fav_ai_result(void)
+{
+    text_wrap_skip(10, -1, s_fav_ai_ptr, 0, 0, 460, 18, 0, 0, &s_wtotal);
+    int total_pages = (s_wtotal + FULL_LINES - 1) / FULL_LINES;
+    if (total_pages < 1) total_pages = 1;
+    if (s_wpage >= total_pages) s_wpage = total_pages - 1;
+    draw_page_chrome("收藏 AI 分析", s_wpage, total_pages);
+    text_wrap_skip(10, 36, s_fav_ai_ptr, s_th_fg, s_th_bg, 460, 18,
+                   FULL_LINES, s_wpage * FULL_LINES, NULL);
+    lcd_draw_rect(10, 250, 130, 268, s_th_border);
+    text_center2(70, 254, "返回收藏", s_th_fg, s_th_bg);
 }
 
 /* ---------- 答题页 ---------- */
@@ -1690,7 +1499,8 @@ static void draw_question_area(const quiz_q_t *q)
         text_wrap_skip(10, 30, q->content, s_th_fg, s_th_bg, 460, 18, 4, 0, NULL);
     }
     draw_pager(10, 102, "题目", s_qpage, qpages);
-    draw_pager(300, 102, "选项", s_opt_page, s_opt_pages);
+    if (q->is_choice == 1)
+        draw_pager(300, 102, "选项", s_opt_page, s_opt_pages);
 }
 
 /* 选项总页数 (每页 2 行/选项) */
@@ -1746,20 +1556,28 @@ static void redraw_option_full(int i)
 static void draw_quiz(void)
 {
     const quiz_q_t *q = get_question(s_qlist[s_qidx]);
+    int qsubj = subj_of(q->subject);
     lcd_clear(s_th_bg);
 
-    /* 顶栏 */
+    /* 顶栏: AI 题带考点名 (截断, 给收藏区留位) */
     lcd_fill_rect(0, 0, 479, 26, s_th_bar);
     char top[64];
-    snprintf(top, sizeof(top), "%s  %d/%d", q->subject, s_qidx + 1, s_qcount);
+    if (q->topic && q->topic[0] && s_qlist[s_qidx] == question_count) {
+        char tb[40];
+        trunc_px(q->topic, tb, sizeof(tb), 70);
+        snprintf(top, sizeof(top), "%s·%s  %d/%d", q->subject, tb,
+                 s_qidx + 1, s_qcount);
+    } else {
+        snprintf(top, sizeof(top), "%s  %d/%d", q->subject, s_qidx + 1, s_qcount);
+    }
     lcd_draw_text(8, 5, top, s_th_bar_fg, s_th_bar);
-    /* 收藏状态 (收藏题查看页也显示, 点★可取消收藏) */
+    /* 收藏状态 (选择/填空/解答题均可收藏; 收藏题查看页也显示, 点★可取消收藏) */
     lcd_draw_text(190, 5, fav_contains(q) ? "★已藏" : "☆收藏",
                   fav_contains(q) ? RED : s_th_bar_fg, s_th_bar);
     draw_ip_bar(1);
 
     /* 题干 (自适应分页) + 控件行 */
-    if (!q->is_choice) {
+    if (q->is_choice != 1) {
         s_opt_pages = 1;
         s_opt_page = 0;
     } else {
@@ -1769,7 +1587,7 @@ static void draw_quiz(void)
     }
     draw_question_area(q);
 
-    if (q->is_choice) {
+    if (q->is_choice == 1) {
         draw_option_area(q);
         if (s_answered) {
             const char *res = (s_opt_sel == q->answer_idx) ? "回答正确" : "回答错误";
@@ -1786,7 +1604,39 @@ static void draw_quiz(void)
                     lcd_draw_text(110, 212, "点解析翻页", s_th_border, s_th_bg);
             }
         } else {
-            text_center(230, "短按选答案  长按提交", s_th_border, s_th_bg);
+            int qpages = (s_qtotal + 3) / 4;
+            if (qpages > 1)
+                text_center(230, "点题目翻页  短按选答案  长按提交", s_th_border, s_th_bg);
+            else
+                text_center(230, "短按选答案  长按提交", s_th_border, s_th_bg);
+        }
+    } else if (q->is_choice == 2) {        /* 键盘填空 (英文/数字答案) */
+        if (s_answered) {
+            lcd_draw_text(10, 212, s_fill_ok ? "回答正确" : "回答错误",
+                          s_fill_ok ? GREEN : RED, s_th_bg);
+            /* 答错且该考点处于薄弱强化区: 红色标记 */
+            if (!s_fill_ok && qsubj >= 0 && s_qlist[s_qidx] == question_count &&
+                q->topic && quiz_topic_weak(qsubj, q->topic))
+                lcd_draw_text(96, 212, "薄弱考点·重点看解析", RED, s_th_bg);
+            lcd_draw_text(10, 228, "我的答案:  ", s_th_fg, s_th_bg);
+            lcd_draw_text(108, 228, s_fill_buf[0] ? s_fill_buf : "(空)",
+                          s_fill_ok ? s_th_fg : RED, s_th_bg);
+            lcd_draw_text(10, 244, "正确答案:  ", s_th_fg, s_th_bg);
+            lcd_draw_text(108, 244, q->answer_text ? q->answer_text : "",
+                          s_fill_ok ? s_th_border : GREEN, s_th_bg);
+            text_center(262, "点下方看解析 · 短按下一题", s_th_border, s_th_bg);
+        } else {
+            lcd_draw_rect(10, 118, 470, 206, s_th_border);
+            if (s_fill_buf[0]) {
+                char fb[80];
+                snprintf(fb, sizeof(fb), "已输入: %s", s_fill_buf);
+                text_center2(240, 150, fb, s_th_fg, s_th_bg);
+                text_center2(240, 172, "点输入框重新输入", s_th_border, s_th_bg);
+            } else {
+                text_center2(240, 150, "点此输入答案", s_th_bar, s_th_bg);
+                text_center2(240, 172, "(仅英文/数字, 软键盘)", s_th_border, s_th_bg);
+            }
+            text_center(230, "点输入框弹键盘 · 长按跳过", s_th_border, s_th_bg);
         }
     } else {
         if (s_show_ans) {
@@ -1811,8 +1661,6 @@ static void ui_handle(int ev);
 static void ui_submit(void);
 
 /* ---------- 解析页 (全屏, 可翻页) ---------- */
-#define EXP_LINES 12           /* 每页行数 */
-#define FULL_LINES 12          /* 全文翻页: 每页行数 */
 
 /* ---------- 翻页页公共框架: 顶栏标题 + 页码 + 动态底部提示 ----------
  * 交互约定: 左半屏=上一页 (首页=返回), 右半屏=下一页 (末页=返回) */
@@ -1838,10 +1686,10 @@ static void draw_page_chrome(const char *title, int page, int total_pages)
 static void draw_explain(void)
 {
     const quiz_q_t *q = get_question(s_qlist[s_qidx]);
-    /* 解答题: 参考答案+解析 合并分页; 选择题: 仅解析 */
+    /* 解答题/填空: 参考答案+解析 合并分页; 选择题: 仅解析 */
     static char expbuf[2048];
     const char *src = q->explanation ? q->explanation : "";
-    if (!q->is_choice) {
+    if (q->is_choice != 1) {
         snprintf(expbuf, sizeof(expbuf), "参考答案: %s\n解析: %s",
                  q->answer_text ? q->answer_text : "",
                  q->explanation ? q->explanation : "");
@@ -1898,10 +1746,10 @@ static const char *s_kb_topics[9][4] = {
     { "自然地理", "人文地理", "区域地理", "地图与图表判读" },
 };
 static int s_kb_subj = 0;
-static int s_kb_slot = 0;        /* 当前操作的槽 0..5 */
+static int s_kb_slot = 0;        /* 当前操作的槽 0..2 */
 static int s_kb_custom_mode = 0; /* 1=自定义主题 (拼音转中文后生成) */
-static int s_kb_list_page = 0;   /* 主题列表页码 (每页 5 行, 6 槽=2 页) */
-static char s_kb_full_buf[4096]; /* 当前主题全文 (生成结果/缓存读取) */
+static int s_kb_list_page = 0;   /* 主题列表页码 (每页 5 行) */
+/* 知识库全文直接引用 weak_get_kb 缓冲, 不再单独缓存 (省 24KB 内存) */
 
 /* 槽 i 显示名: 已生成=槽内名称; 空=预置名(i<4) 或 "(空槽)" */
 static const char *kb_slot_name(int i)
@@ -1914,25 +1762,16 @@ static const char *kb_slot_name(int i)
     return "(空槽)";
 }
 
-/* 加载当前槽内容到全文缓冲; 返回 "" 表示未生成 */
+/* 加载当前槽内容; 返回 "" 表示未生成 (直接引用 weak_get_kb 静态缓冲) */
 static const char *kb_load(void)
 {
-    s_kb_full_buf[0] = 0;
-    const char *kb = weak_get_kb(s_kb_subj, s_kb_slot);
-    if (kb[0]) {
-        strncpy(s_kb_full_buf, kb, sizeof(s_kb_full_buf) - 1);
-        s_kb_full_buf[sizeof(s_kb_full_buf) - 1] = 0;
-    }
-    return s_kb_full_buf;
+    return weak_get_kb(s_kb_subj, s_kb_slot);
 }
 
-/* 找空槽: 优先扩展槽 4-5, 再预置槽 0-3; 无空槽返回 -1 */
+/* 找空槽; 无空槽返回 -1 */
 static int kb_find_empty(void)
 {
-    for (int i = 4; i < WEAK_KB_CNT; i++)
-        if (!weak_get_kb_name(s_kb_subj, i)[0])
-            return i;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < WEAK_KB_CNT; i++)
         if (!weak_get_kb_name(s_kb_subj, i)[0])
             return i;
     return -1;
@@ -2009,7 +1848,15 @@ static void draw_kb_topics(void)
         lcd_draw_rect(314, 212, 470, 236, s_th_border);
         text_center2(392, 216, "下页 >", s_kb_list_page + 1 < total_pages ? s_th_fg : s_th_border, s_th_bg);
     } else {
-        text_center(224, "点行查看 · 未生成点行生成 · 右侧删除", s_th_border, s_th_bg);
+        char cap[80];
+        int used = weak_kb_used_slots(s_kb_subj);
+        int remain = weak_kb_remain_bytes(s_kb_subj);
+        snprintf(cap, sizeof(cap),
+                 "容量: 已用 %d/%d 槽 · 剩余 %dKB / %dKB",
+                 used, WEAK_KB_CNT, remain / 1024,
+                 weak_kb_capacity_bytes() / 1024);
+        text_center(214, cap, s_th_bar, s_th_bg);
+        text_center(230, "点行查看 · 未生成点行生成 · 右侧删除", s_th_border, s_th_bg);
     }
 
     /* 底部: [自定义主题] [返回] */
@@ -2017,6 +1864,99 @@ static void draw_kb_topics(void)
     text_center2(130, 244, "自定义主题", s_th_bar_fg, s_th_bar);
     lcd_draw_rect(256, 240, 470, 264, s_th_border);
     text_center2(363, 244, "返回", s_th_fg, s_th_bg);
+}
+
+/* 简易 Markdown 清洗 (知识库 AI 输出用):
+ * - 行首 # 标题符 / > 引用符 删除 (内容保留)
+ * - 行首 - * + 列表符 → · (分隔线, 如三个连字符或三个星号, 整行丢弃)
+ * - 行内 * ` _ 强调/代码标记删除
+ * - 连续空行压缩为一个 */
+static void md_clean(const char *src, char *dst, int dstsz)
+{
+    int j = 0;
+    int line_start = 1;
+    int prev_nl = 1;
+    for (const char *p = src; *p && j < dstsz - 1; p++) {
+        char c = *p;
+        if (c == '\n') {
+            if (!prev_nl) {
+                dst[j++] = '\n';
+                prev_nl = 1;
+            }
+            line_start = 1;
+            continue;
+        }
+        if (line_start) {
+            line_start = 0;
+            if (c == '#') {                        /* 标题行: 去井号+空格 */
+                while (*p == '#' || *p == ' ' || *p == '\t') p++;
+                c = *p;
+                if (c == '\n' || c == 0) {
+                    if (!prev_nl) { dst[j++] = '\n'; prev_nl = 1; }
+                    line_start = 1;
+                    continue;
+                }
+            } else if (c == '>') {                 /* 引用: 去符号 */
+                if (p[1] == ' ') p++;
+                continue;
+            } else if (c == '-' || c == '*' || c == '_') {
+                /* 分隔线: --- *** ___ 整行丢弃 */
+                if ((p[1] == c && p[2] == c) && (p[3] == '\n' || p[3] == 0)) {
+                    while (*p && *p != '\n') p++;
+                    p--;
+                    continue;
+                }
+                if (p[1] == ' ') {                 /* 列表项 → · (2字节, 保证原地安全) */
+                    p++;
+                    if (j < dstsz - 2) {
+                        dst[j++] = 0xC2;
+                        dst[j++] = 0xB7;
+                    }
+                    prev_nl = 0;
+                    continue;
+                }
+                if (c == '*' || c == '_')
+                    continue;                      /* 行首裸符号丢弃 */
+            }
+        }
+        if (c == '*' || c == '`' || c == '_' || c == '#')
+            continue;                              /* 行内强调/代码标记 */
+        dst[j++] = c;
+        prev_nl = 0;
+    }
+    while (j > 0 && (dst[j - 1] == '\n' || dst[j - 1] == ' '))
+        j--;
+    dst[j] = 0;
+
+    /* 兜底分段: AI 偶发把 "1.xxx 2.yyy" 挤成一段不换行.
+     * 扫描 "数字." 后跟 空格/汉字/行尾 的编号, 前面非行首/换行/数字时补 \n
+     * (前一个字符是空格则直接替换), 让每个编号点单独成行. */
+    {
+        int k = 0;
+        while (dst[k] && k < dstsz - 3) {
+            if (dst[k] >= '0' && dst[k] <= '9') {
+                int kk = k;
+                while (dst[kk] >= '0' && dst[kk] <= '9')
+                    kk++;
+                if (dst[kk] == '.' &&
+                    (dst[kk + 1] == ' ' || dst[kk + 1] == 0 ||
+                     (uint8_t)dst[kk + 1] >= 0x80) &&   /* 空格/行尾/汉字 */
+                    k > 0 && dst[k - 1] != '\n' &&
+                    !(dst[k - 1] >= '0' && dst[k - 1] <= '9') &&
+                    dst[k - 1] != '.') {
+                    if (dst[k - 1] == ' ')
+                        dst[k - 1] = '\n';          /* 空格原位变换行 */
+                    else if (strlen(dst) < (size_t)dstsz - 1) {   /* 防越界 */
+                        memmove(dst + k + 1, dst + k, strlen(dst + k) + 1);
+                        dst[k] = '\n';
+                    }
+                    k = kk + 1;
+                    continue;
+                }
+            }
+            k++;
+        }
+    }
 }
 
 static void kb_run(void)               /* 生成知识库 (阻塞) */
@@ -2030,10 +1970,22 @@ static void kb_run(void)               /* 生成知识库 (阻塞) */
         s_state = 18;
         return;
     }
+    /* 空间检查: 生成后该科知识库区必须剩余 ≥ 1 槽 (整槽物理占用) */
+    int kb_remain = weak_kb_remain_bytes(s_kb_subj);
+    if (kb_remain < WEAK_KB_SLOT) {
+        lcd_clear(s_th_bg);
+        char mbuf[64];
+        snprintf(mbuf, sizeof(mbuf), "知识库空间不足: 剩余 %dKB (需 ≥16KB)",
+                 kb_remain / 1024);
+        text_center(100, mbuf, RED, s_th_bg);
+        text_center(130, "请删除已有主题后重试", s_th_border, s_th_bg);
+        s_state = 18;
+        return;
+    }
     /* 主题名: 自定义输入(拼音)先经 AI 转中文 */
     char name[64];
     if (s_kb_custom_mode) {
-        const char *cn = ai_translate_topic(s_kb_custom);
+        const char *cn = ai_translate_topic(s_subjects[s_kb_subj], s_kb_custom);
         snprintf(name, sizeof(name), "%s", cn[0] ? cn : s_kb_custom);
     } else {
         snprintf(name, sizeof(name), "%s", kb_slot_name(s_kb_slot));
@@ -2042,19 +1994,17 @@ static void kb_run(void)               /* 生成知识库 (阻塞) */
     char sbuf[96];
     snprintf(sbuf, sizeof(sbuf), "AI 生成中... (%s)", name);
     text_center(110, sbuf, s_th_fg, s_th_bg);
-    text_center(140, "最长 90 秒, 请稍候", s_th_border, s_th_bg);
+    text_center(140, "最长 5 分钟, 失败自动重试", s_th_border, s_th_bg);
     const char *kb = ai_get_knowledge(s_subjects[s_kb_subj], name);
     if (kb[0]) {
         weak_set_kb(s_kb_subj, s_kb_slot, name, kb);
-        strncpy(s_kb_full_buf, kb, sizeof(s_kb_full_buf) - 1);
-        s_kb_full_buf[sizeof(s_kb_full_buf) - 1] = 0;
         s_kb_page = 0;
         s_state = 19;
         draw_kb_full();
     } else {
         lcd_clear(s_th_bg);
         text_center(100, "生成失败", RED, s_th_bg);
-        text_center(130, "检查网络 / API Key", s_th_border, s_th_bg);
+        text_center(130, ai_last_error(), s_th_fg, s_th_bg);
         text_center(150, "点击重试 / 长按返回", s_th_border, s_th_bg);
         s_state = 18;
     }
@@ -2062,7 +2012,9 @@ static void kb_run(void)               /* 生成知识库 (阻塞) */
 
 static void draw_kb_full(void)         /* 知识库全文页 (可翻页) */
 {
-    const char *kb = s_kb_full_buf;
+    const char *kb = kb_load();          /* 直接引用 weak_get_kb 缓冲 */
+    if (kb[0])                           /* 原地清洗 markdown (省 24KB 静态) */
+        md_clean(kb, (char *)kb, KB_OUT_MAX);
     text_wrap_skip(10, -1, kb, 0, 0, 460, 18, 0, 0, &s_wtotal);
     int total_pages = (s_wtotal + FULL_LINES - 1) / FULL_LINES;
     if (total_pages < 1) total_pages = 1;
@@ -2095,13 +2047,14 @@ static void ai_next_question(void)
     if (ai_generate_question(s_ai_subject) == 0) {
         s_qcount = 1;
         s_qlist[0] = question_count;
-        s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+        s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
         s_state = 1;
         draw_quiz();
     } else {
         lcd_clear(s_th_bg);
         text_center(100, "出题失败", RED, s_th_bg);
-        text_center(130, "点击重试 / 长按返回", s_th_border, s_th_bg);
+        text_center(120, ai_last_error(), s_th_fg, s_th_bg);   /* E 错误码 */
+        text_center(142, "点击重试 / 长按返回", s_th_border, s_th_bg);
         s_state = 10;
     }
 }
@@ -2131,7 +2084,15 @@ static void draw_ai_subject(void)
         int x = 10 + (i % 3) * 158, y = 40 + (i / 3) * 70;
         lcd_fill_rect(x, y, x + 148, y + 60, s_th_bg);
         lcd_draw_rect(x, y, x + 148, y + 60, s_th_border);
-        text_center2(x + 74, y + 22, s_subjects[i], BLACK, s_th_bg);
+        text_center2(x + 74, y + 22, s_subjects[i], s_th_fg, s_th_bg);   /* 夜间主题下 BLACK 不可见 */
+        /* 该科最薄弱板块 (无错题记录则不显示) */
+        const char *wt = quiz_weak_topic(i);
+        if (wt[0]) {
+            char wbuf[48];
+            snprintf(wbuf, sizeof(wbuf), "薄弱:%s", wt);
+            trunc_px(wbuf, wbuf, sizeof(wbuf), 132);
+            lcd_draw_text(x + 8, y + 41, wbuf, RED, s_th_bg);
+        }
     }
 }
 
@@ -2139,7 +2100,7 @@ static void draw_ai_subject(void)
  * 所以先复制 content 再逐槽比较 (收藏题查看时 q 就是 g_fav_q) */
 static int fav_toggle(const quiz_q_t *q)
 {
-    char qbuf[512];
+    char qbuf[2048];
     if (!q->content)
         return 0;
     strncpy(qbuf, q->content, sizeof(qbuf) - 1);
@@ -2224,17 +2185,24 @@ static void ui_touch(int sx, int sy)
             s_state = 0;
             draw_menu();
         }
-    } else if (s_state == 11) {             /* 收藏夹: 点选查看 / 底部翻页 */
+    } else if (s_state == 11) {             /* 收藏夹: 点选查看 / AI 分析 / 底部翻页 */
         int n = fav_count();
         int total_pages = (n + 5 - 1) / 5;
         if (total_pages < 1) total_pages = 1;
-        if (total_pages > 1 && sy >= 230) {  /* 底部翻页按钮 */
-            if (sx < 156 && s_fav_page > 0) {
-                s_fav_page--;
-                draw_fav_list();
-            } else if (sx >= 314 && s_fav_page + 1 < total_pages) {
-                s_fav_page++;
-                draw_fav_list();
+        if (sy >= 230) {                     /* 底部: [AI 分析] + 翻页 */
+            if (sx < 130) {                  /* AI 分析: 进入选题页 */
+                s_sel_fav_page = 0;
+                s_sel_warn = 0;
+                s_state = 22;
+                draw_fav_select();
+            } else if (total_pages > 1) {
+                if (sx < 232 && s_fav_page > 0) {
+                    s_fav_page--;
+                    draw_fav_list();
+                } else if (sx >= 340 && s_fav_page + 1 < total_pages) {
+                    s_fav_page++;
+                    draw_fav_list();
+                }
             }
             return;
         }
@@ -2249,13 +2217,17 @@ static void ui_touch(int sx, int sy)
                 if (fav_get(i) == 0) {
                     s_qcount = 1;
                     s_qlist[0] = question_count + 1;   /* 收藏题 */
-                    s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+                    s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
                     s_state = 1;
                     draw_quiz();
                 }
             }
         }
     } else if (s_state == 12) {             /* 薄弱点选科 */
+        if (sy < 26) {                      /* 顶栏: 返回主菜单 */
+            if (sx > 330) { s_state = 0; draw_menu(); }
+            return;
+        }
         int col = (sx - 10) / 158, row = (sy - 40) / 70;
         if (col >= 0 && col < 3 && row >= 0 && row < 3) {
             s_weak_subj = row * 3 + col;
@@ -2269,6 +2241,10 @@ static void ui_touch(int sx, int sy)
             }
         }
     } else if (s_state == 13) {             /* 薄弱点错题页: 左右翻页 */
+        if (sy < 26) {                      /* 顶栏: 返回主菜单 */
+            if (sx > 330) { s_state = 0; draw_menu(); }
+            return;
+        }
         if (sy >= 240) {
             if (sx < 156) {                 /* AI 总结 (无总结时无效) */
                 if (weak_get_ai(s_weak_subj)[0]) {
@@ -2297,45 +2273,63 @@ static void ui_touch(int sx, int sy)
             if (shown < 0) shown = 0;
             int ly = 46 + shown * 30;
             if (n > 4 || n == 0) ly += 18;
-            if (sy >= ly + 8 && sy <= ly + 55) {
+            /* 仅"全屏查看总结 >"入口行触发全屏; 预览文字区留给翻页 */
+            if (sy >= ly + 40 && sy <= ly + 56) {
                 s_wpage = 0;
                 s_state = 16;
                 draw_weak_full();
                 return;
             }
         }
-        /* 列表区左右半屏翻页 */
+        /* 列表区左右半屏翻页 (局部刷新, 顶栏不动) */
         if (sx < 240) {
             if (s_weak_list_page > 0) {
                 s_weak_list_page--;
-                draw_weak_page();
+                draw_weak_page_body();
             }
         } else {
             if (s_weak_list_page + 1 < total_pages) {
                 s_weak_list_page++;
-                draw_weak_page();
+                draw_weak_page_body();
             }
         }
     } else if (s_state == 14) {             /* 薄弱点失败: 点击返回 */
         s_state = 13;
         draw_weak_page();
     } else if (s_state == 20) {             /* 选题分析: 勾选/翻页/底部按钮 */
+        if (sy < 26) {                      /* 顶栏: 返回错题页 */
+            if (sx > 330) { s_state = 13; draw_weak_page(); }
+            return;
+        }
+        if (s_sel_warn) {                   /* "请先勾选"提示页: 点击任意处返回 */
+            s_sel_warn = 0;
+            draw_weak_select();
+            return;
+        }
         int n = weak_count(s_weak_subj);
         if (sy >= 240) {                    /* 底部按钮 */
-            if (sx < 156) {                 /* 全选/清空 */
+            if (sx < 156) {                 /* 全选/清空 (全选最多勾 5 题) */
                 int sel = 0;
                 for (int i = 0; i < n && i < 20; i++)
                     if (s_sel_wrong[i]) sel++;
-                for (int i = 0; i < n && i < 20; i++)
-                    s_sel_wrong[i] = (sel == n) ? 0 : 1;
-                draw_weak_select();
+                if (sel == n) {             /* 全选状态 → 清空 */
+                    for (int i = 0; i < n && i < 20; i++)
+                        s_sel_wrong[i] = 0;
+                } else {                    /* 勾选前 min(n,5) 题 */
+                    int limit = n < 5 ? n : 5;
+                    for (int i = 0; i < n && i < 20; i++)
+                        s_sel_wrong[i] = i < limit;
+                }
+                draw_weak_select_body();
             } else if (sx < 308) {          /* 分析选中 */
                 char topics[1500] = "";
                 int sel = 0;
                 for (int i = 0; i < n && i < 20; i++) {
                     if (s_sel_wrong[i]) {
                         char t[130];
-                        if (weak_get_wrong(s_weak_subj, i, t, sizeof(t)) == 0) {
+                        /* 勾选索引=显示序 (0=最新), 与列表/编号一致 */
+                        if (weak_get_wrong(s_weak_subj, weak_show_idx(i),
+                                           t, sizeof(t)) == 0) {
                             char one[160];
                             snprintf(one, sizeof(one), "%d.%s；", sel + 1, t);
                             if (strlen(topics) + strlen(one) < sizeof(topics))
@@ -2344,11 +2338,11 @@ static void ui_touch(int sx, int sy)
                         }
                     }
                 }
-                if (sel == 0) {             /* 未选择 */
+                if (sel == 0) {             /* 未选择: 提示页, 点击任意处返回 */
                     lcd_clear(s_th_bg);
                     text_center(110, "请先勾选要分析的题", RED, s_th_bg);
                     text_center(140, "点击返回", s_th_border, s_th_bg);
-                    s_state = 20;
+                    s_sel_warn = 1;
                     return;
                 }
                 weak_ai_do(topics);
@@ -2358,18 +2352,153 @@ static void ui_touch(int sx, int sy)
             }
             return;
         }
-        if (sy >= 48 && sy <= 238 && n > 0) {   /* 行点击: 勾选; 未命中: 翻页 */
+        if (sy >= 48 && sy <= 238 && n > 0) {   /* 本页行点击: 勾选; 其余区域: 翻页 */
             int total_pages = (n + 3) / 4;
-            int i = s_sel_page * 4 + (sy - 48) / 32;
-            if (i >= 0 && i < n && i < 20) {
+            int page_first = s_sel_page * 4;
+            int i = page_first + (sy - 48) / 32;
+            /* 只有点击当前页可见的行才勾选; 点空白/提示行/下一页行位一律翻页 */
+            if (i >= page_first && i < page_first + 4 && i < n && i < 20) {
+                if (!s_sel_wrong[i]) {      /* 新勾选: 限 5 题 (单次分析上限) */
+                    int sel = 0;
+                    for (int j = 0; j < n && j < 20; j++)
+                        if (s_sel_wrong[j]) sel++;
+                    if (sel >= 5) {
+                        lcd_clear(s_th_bg);
+                        text_center(110, "一次最多分析 5 题", RED, s_th_bg);
+                        text_center(140, "请先取消部分勾选", s_th_border, s_th_bg);
+                        text_center(160, "点击返回", s_th_border, s_th_bg);
+                        s_sel_warn = 1;
+                        return;
+                    }
+                }
                 s_sel_wrong[i] = !s_sel_wrong[i];
-                draw_weak_select();
+                redraw_sel_row(i);          /* 局部刷新: 单行 + 计数行 */
+                redraw_sel_count();
                 return;
             }
             if (sx < 240) {
-                if (s_sel_page > 0) { s_sel_page--; draw_weak_select(); }
+                if (s_sel_page > 0) { s_sel_page--; draw_weak_select_body(); }
             } else {
-                if (s_sel_page + 1 < total_pages) { s_sel_page++; draw_weak_select(); }
+                if (s_sel_page + 1 < total_pages) { s_sel_page++; draw_weak_select_body(); }
+            }
+        }
+    } else if (s_state == 22) {             /* 收藏选题: 勾选/翻页/底部按钮 */
+        if (sy < 26) {                      /* 顶栏: 返回收藏列表 */
+            if (sx > 330) { s_state = 11; draw_fav_list(); }
+            return;
+        }
+        if (s_sel_warn) {                   /* "请先勾选"/"无收藏"提示页: 点击任意处返回 */
+            s_sel_warn = 0;
+            draw_fav_select();
+            return;
+        }
+        int n = fav_count();
+        if (sy >= 240) {                    /* 底部按钮 */
+            if (sx < 156) {                 /* 全选/清空 (全选最多勾 5 题) */
+                int sel = 0;
+                for (int i = 0; i < n && i < 64; i++)
+                    if (s_sel_fav[i]) sel++;
+                if (sel == 0) {             /* 未选 → 勾选前 min(n,5) 题 */
+                    int limit = n < 5 ? n : 5;
+                    for (int i = 0; i < limit; i++)
+                        s_sel_fav[i] = 1;
+                } else {                    /* 已选 → 清空 */
+                    for (int i = 0; i < n && i < 64; i++)
+                        s_sel_fav[i] = 0;
+                }
+                draw_fav_select_body();
+            } else if (sx < 308) {          /* 分析选中 */
+                char topics[1500] = "";
+                int sel = 0;
+                const char *subj_first = NULL;
+                int mixed = 0;
+                for (int i = 0; i < n && i < 64; i++) {
+                    if (s_sel_fav[i]) {
+                        if (fav_get(i) == 0) {
+                            char one[220];
+                            snprintf(one, sizeof(one), "%d.[%s]%s；", sel + 1,
+                                     g_fav_q.subject ? g_fav_q.subject : "?",
+                                     g_fav_q.content);
+                            if (!subj_first)
+                                subj_first = g_fav_q.subject;
+                            else if (strcmp(subj_first, g_fav_q.subject) != 0)
+                                mixed = 1;
+                            if (strlen(topics) + strlen(one) < sizeof(topics))
+                                strcat(topics, one);
+                            sel++;
+                        }
+                    }
+                }
+                if (sel == 0) {             /* 未选择: 提示页 */
+                    lcd_clear(s_th_bg);
+                    text_center(110, "请先勾选要分析的题", RED, s_th_bg);
+                    text_center(140, "点击返回", s_th_border, s_th_bg);
+                    s_sel_warn = 1;
+                    return;
+                }
+                fav_ai_do(mixed ? "综合" : (subj_first ? subj_first : "综合"),
+                          topics);
+            } else {                        /* 返回收藏列表 */
+                s_state = 11;
+                draw_fav_list();
+            }
+            return;
+        }
+        if (sy >= 48 && sy <= 238 && n > 0) {   /* 行点击: 勾选; 其余: 翻页 */
+            int total_pages = (n + 3) / 4;
+            int page_first = s_sel_fav_page * 4;
+            int i = page_first + (sy - 48) / 32;
+            if (i >= page_first && i < page_first + 4 && i < n && i < 64) {
+                if (!s_sel_fav[i]) {        /* 新勾选: 限 5 题 */
+                    int sel = 0;
+                    for (int j = 0; j < n && j < 64; j++)
+                        if (s_sel_fav[j]) sel++;
+                    if (sel >= 5) {
+                        lcd_clear(s_th_bg);
+                        text_center(110, "一次最多分析 5 题", RED, s_th_bg);
+                        text_center(140, "请先取消部分勾选", s_th_border, s_th_bg);
+                        text_center(160, "点击返回", s_th_border, s_th_bg);
+                        s_sel_warn = 1;
+                        return;
+                    }
+                }
+                s_sel_fav[i] = !s_sel_fav[i];
+                redraw_fav_row(i);
+                redraw_fav_count();
+                return;
+            }
+            if (sx < 240) {
+                if (s_sel_fav_page > 0) { s_sel_fav_page--; draw_fav_select_body(); }
+            } else {
+                if (s_sel_fav_page + 1 < total_pages) { s_sel_fav_page++; draw_fav_select_body(); }
+            }
+        }
+    } else if (s_state == 23) {             /* 收藏分析结果: 左翻上/右翻下, [返回收藏] */
+        if (sy < 26) {                      /* 顶栏: 返回收藏列表 */
+            if (sx > 330) { s_state = 11; draw_fav_list(); }
+            return;
+        }
+        if (sy >= 250 && sx <= 130) {       /* 底部 [返回收藏] */
+            s_state = 11;
+            draw_fav_list();
+            return;
+        }
+        int total_pages = (s_wtotal + FULL_LINES - 1) / FULL_LINES;
+        if (sx < 240) {
+            if (s_wpage > 0) {
+                s_wpage--;
+                draw_fav_ai_result();
+            } else {
+                s_state = 11;
+                draw_fav_list();
+            }
+        } else {
+            if (s_wpage + 1 < total_pages) {
+                s_wpage++;
+                draw_fav_ai_result();
+            } else {
+                s_state = 11;
+                draw_fav_list();
             }
         }
     } else if (s_state == 1) {              /* 答题 */
@@ -2379,7 +2508,7 @@ static void ui_touch(int sx, int sy)
                 quiz_back();
                 return;
             }
-            if (sx >= 170 && sx <= 260) {   /* ★ 收藏/取消收藏 */
+            if (sx >= 170 && sx <= 260) {   /* ★ 收藏/取消收藏 (含填空/解答题) */
                 fav_toggle(q);
                 if (s_qlist[0] == question_count + 1) {
                     /* 收藏题: 取消收藏后回收藏列表 */
@@ -2423,7 +2552,7 @@ static void ui_touch(int sx, int sy)
                 return;
             }
         }
-        if (q->is_choice) {
+        if (q->is_choice == 1) {
             if (sy >= 118 && sy <= 206) {   /* 选项区: 点哪个答哪个 */
                 int i = (sy >= 166) ? 2 : 0;
                 i += (sx >= 244) ? 1 : 0;
@@ -2445,6 +2574,16 @@ static void ui_touch(int sx, int sy)
                 s_state = 3;
                 draw_explain();
             }
+        } else if (q->is_choice == 2) {     /* 填空: 点输入区弹键盘 */
+            if (!s_answered && sy >= 118 && sy <= 206) {
+                kb_open(4, s_fill_buf);
+                s_state = 5;
+                kb_draw();
+            } else if (s_answered && sy > 210) {  /* 解析区: 进入解析页 */
+                s_exp_page = 0;
+                s_state = 3;
+                draw_explain();
+            }
         } else {                            /* 解答题 */
             if (sy > 160) {
                 if (!s_show_ans) { s_show_ans = 1; draw_quiz(); }
@@ -2459,9 +2598,9 @@ static void ui_touch(int sx, int sy)
                         return;
                     }
                     if (s_qidx == s_qcount - 1) { quiz_finished(); }
-                    else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; draw_quiz(); }
+                    else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0; draw_quiz(); }
                 } else if (s_qidx == s_qcount - 1) { quiz_finished(); }
-                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; draw_quiz(); }
+                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0; draw_quiz(); }
             }
         }
     } else if (s_state == 3) {              /* 解析页: 左翻上/右翻下, 边界返回 */
@@ -2480,7 +2619,7 @@ static void ui_touch(int sx, int sy)
                 draw_explain();
             } else {
                 if (s_qidx == s_qcount - 1) { quiz_finished(); }
-                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_state = 1; draw_quiz(); }
+                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0; s_state = 1; draw_quiz(); }
             }
         }
     } else if (s_state == 15) {             /* 题目全文: 左翻上/右翻下, 边界返回 */
@@ -2503,6 +2642,10 @@ static void ui_touch(int sx, int sy)
             }
         }
     } else if (s_state == 16) {             /* 总结全文: 左翻上/右翻下, [错题列表] */
+        if (sy < 26) {                      /* 顶栏: 返回主菜单 */
+            if (sx > 330) { s_state = 0; draw_menu(); }
+            return;
+        }
         if (sy >= 250 && sx <= 130) {       /* 底部 [错题列表] 按钮 */
             s_state = 13;
             draw_weak_page();
@@ -2549,12 +2692,9 @@ static void ui_touch(int sx, int sy)
                     return;
                 }
                 s_kb_custom_mode = 1;
-                s_kb_field = 3;
-                snprintf(s_kb_buf, sizeof(s_kb_buf), "%s", s_kb_custom);
-                s_kb_shift = 0;
-                s_kb_sym = 0;
+                kb_open(3, s_kb_custom);
                 s_state = 5;
-                draw_keyboard();
+                kb_draw();
             } else {                        /* 返回选科 */
                 s_state = 17;
                 draw_kb_subject();
@@ -2591,12 +2731,9 @@ static void ui_touch(int sx, int sy)
                     kb_run();
                 } else {                    /* 空扩展槽: 走自定义输入 */
                     s_kb_custom_mode = 1;
-                    s_kb_field = 3;
-                    snprintf(s_kb_buf, sizeof(s_kb_buf), "%s", s_kb_custom);
-                    s_kb_shift = 0;
-                    s_kb_sym = 0;
+                    kb_open(3, s_kb_custom);
                     s_state = 5;
-                    draw_keyboard();
+                    kb_draw();
                 }
             }
         }
@@ -2634,7 +2771,7 @@ static void ui_touch(int sx, int sy)
             }
         }
     } else if (s_state == 4) {              /* 设置列表 */
-        if (sy >= 244) {                    /* 底部按钮 */
+        if (sy >= 248) {                    /* 底部按钮 */
             if (sx < 240) {                 /* 扫描 WiFi */
                 lcd_clear(s_th_bg);
                 text_center(130, "扫描中...", s_th_border, s_th_bg);
@@ -2642,14 +2779,11 @@ static void ui_touch(int sx, int sy)
                 s_state = 6;
                 draw_ap_list();
             } else {                        /* 手动输入 SSID */
-                s_kb_field = 0;
-                snprintf(s_kb_buf, sizeof(s_kb_buf), "%s", s_wifi_ssid);
-                s_kb_shift = 0;
-                s_kb_sym = 0;
+                kb_open(0, s_wifi_ssid);
                 s_state = 5;
-                draw_keyboard();
+                kb_draw();
             }
-        } else if (sy >= 188 && sy <= 214) { /* 亮度: 左减右加 */
+        } else if (sy >= 178 && sy <= 200) { /* 亮度: 左减右加 */
             if (sx < 240) {
                 if (s_brightness > 5) {
                     backlight_set(s_brightness - 10);
@@ -2662,29 +2796,38 @@ static void ui_touch(int sx, int sy)
                 }
             }
             draw_settings();
-        } else if (sy >= 158 && sy <= 184) { /* 主题: 点击切换 */
+        } else if (sy >= 154 && sy <= 176) { /* 主题: 点击切换 */
             theme_apply((s_theme + 1) % 3);
             settings_save();
             draw_settings();
-        } else if (sy >= 218 && sy <= 242) { /* 年级: 点击切换 */
-            s_grade = (s_grade + 1) % 3;
+        } else if (sy >= 202 && sy <= 224) { /* 年级/难度: 左半=年级, 右半=难度 */
+            if (sx < 240)
+                s_grade = (s_grade + 1) % 3;
+            else
+                s_diff = (s_diff + 1) % 3;
             settings_save();
             draw_settings();
-        } else if (sy >= 34 && sy <= 154) {
-            int i = (sy - 34) / 40;
-            if (i == 2) {                   /* API Key: 网页输入 */
+        } else if (sy >= 30 && sy <= 150) {
+            int i = (sy - 30) / 30;
+            if (i == 3) {                   /* 填空比例: 左减右加 5% */
+                if (sx < 240) {
+                    if (s_fill_pct > 0)
+                        s_fill_pct -= 5;
+                } else {
+                    if (s_fill_pct < 100)
+                        s_fill_pct += 5;
+                }
+                settings_save();
+                draw_settings();
+            } else if (i == 2) {            /* API Key: 网页输入 */
                 if (s_wifi_state == 2)
                     http_server_start();
                 s_state = 7;
                 draw_api_page();
             } else if (i >= 0 && i < 2) {
-                s_kb_field = i;
-                snprintf(s_kb_buf, sizeof(s_kb_buf), "%s",
-                         i == 0 ? s_wifi_ssid : s_wifi_pass);
-                s_kb_shift = 0;
-                s_kb_sym = 0;
+                kb_open(i, i == 0 ? s_wifi_ssid : s_wifi_pass);
                 s_state = 5;
-                draw_keyboard();
+                kb_draw();
             }
         }
     } else if (s_state == 6) {              /* WiFi 列表: 点选 AP */
@@ -2693,51 +2836,10 @@ static void ui_touch(int sx, int sy)
             if (i >= 0 && i < s_ap_count && i < 7) {
                 memcpy(s_wifi_ssid, s_ap_list[i].ssid, 32);
                 s_wifi_ssid[32] = 0;
-                s_kb_field = 1;             /* 输入密码 */
-                snprintf(s_kb_buf, sizeof(s_kb_buf), "%s", s_wifi_pass);
-                s_kb_shift = 0;
-                s_kb_sym = 0;
+                kb_open(1, s_wifi_pass);   /* 输入密码 */
                 s_state = 5;
-                draw_keyboard();
+                kb_draw();
             }
-        }
-    } else if (s_state == 5) {              /* 键盘 */
-        int r = kb_touch(sx, sy);
-        if (r == 1 || r == 3) {
-            /* 局部刷新: 输入框 (+shift 键) — 打字跟手 */
-            lcd_fill_rect(6, 30, 474, 44, s_th_bg);
-            lcd_draw_rect(6, 30, 474, 44, s_th_border);
-            int blen = strlen(s_kb_buf);
-            const char *disp = s_kb_buf;
-            if (blen > 28)
-                disp = s_kb_buf + blen - 28;
-            lcd_draw_text(10, 31, disp, s_th_fg, s_th_bg);
-            if (r == 3 && !s_kb_sym) {
-                int sx0 = 2, sy0 = KB_Y0 + 4 * KB_H + 2;
-                lcd_fill_rect(sx0, sy0, sx0 + KB_W - 4, sy0 + KB_H - 4,
-                              s_kb_shift ? s_th_sel : s_th_sel);
-                lcd_draw_rect(sx0, sy0, sx0 + KB_W - 4, sy0 + KB_H - 4, s_th_border);
-                lcd_draw_char(sx0 + (KB_W - 14) / 2, sy0 + 8, '^', BLACK,
-                              s_kb_shift ? s_th_sel : s_th_sel);
-            }
-        } else if (r == 2) {
-            if (s_kb_field == 3) {          /* 知识库自定义主题: 直接生成 */
-                if (!s_kb_custom[0]) {      /* 空主题名: 提示 */
-                    lcd_clear(s_th_bg);
-                    text_center(110, "主题名不能为空", RED, s_th_bg);
-                    text_center(140, "点击返回主题列表", s_th_border, s_th_bg);
-                    s_state = 18;
-                    return;
-                }
-                s_kb_custom_mode = 1;
-                s_state = 18;
-                kb_run();
-            } else {
-                s_state = 4;
-                draw_settings();
-            }
-        } else if (r == 4) {
-            draw_keyboard();
         }
     } else if (s_state == 2) {
         s_state = 0;
@@ -2787,7 +2889,7 @@ static void ui_handle(int ev)
                 text_center(150, "长按返回", s_th_border, s_th_bg);
                 s_state = 2;            /* 空科目提示态 */
             } else {
-                s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+                s_qidx = 0; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
                 s_state = 1;
                 draw_quiz();
             }
@@ -2795,15 +2897,22 @@ static void ui_handle(int ev)
     } else if (s_state == 1) {          /* 答题 */
         const quiz_q_t *q = get_question(s_qlist[s_qidx]);
         if (ev == 2) {                  /* 长按 */
-            if (q->is_choice && !s_answered) {
-                ui_submit();            /* 提交答案 */
+            if (q->is_choice == 1 && !s_answered) {
+                ui_submit();            /* 选择题: 提交答案 */
+            } else if (q->is_choice == 2 && !s_answered) {
+                /* 填空未答: 长按跳过 (不判分) */
+                if (s_qidx == s_qcount - 1) {
+                    quiz_finished();} else {
+                    s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
+                    draw_quiz();
+                }
             } else if (s_qidx == s_qcount - 1) {
                 quiz_finished();} else {
-                s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+                s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
                 draw_quiz();
             }
         } else if (ev == 1) {           /* 短按 */
-            if (q->is_choice) {
+            if (q->is_choice == 1) {
                 if (!s_answered) {
                     s_opt_sel = (s_opt_sel + 1) % 4;
                     redraw_option_full(s_opt_sel);           /* 新选中 */
@@ -2811,7 +2920,16 @@ static void ui_handle(int ev)
                 } else {
                     if (s_qidx == s_qcount - 1) {
                         quiz_finished();} else {
-                        s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+                        s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
+                        draw_quiz();
+                    }
+                }
+            } else if (q->is_choice == 2) {
+                /* 填空: 答完后短按下一题 (未答时短按无操作) */
+                if (s_answered) {
+                    if (s_qidx == s_qcount - 1) {
+                        quiz_finished();} else {
+                        s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
                         draw_quiz();
                     }
                 }
@@ -2822,7 +2940,7 @@ static void ui_handle(int ev)
                 } else {
                     if (s_qidx == s_qcount - 1) {
                         quiz_finished();} else {
-                        s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0;
+                        s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0;
                         draw_quiz();
                     }
                 }
@@ -2837,14 +2955,14 @@ static void ui_handle(int ev)
         int total_pages = (s_exp_total + EXP_LINES - 1) / EXP_LINES;
         if (ev == 2) {
             if (s_qidx == s_qcount - 1) { quiz_finished(); }
-            else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_state = 1; draw_quiz(); }
+            else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0; s_state = 1; draw_quiz(); }
         } else if (ev == 1) {
             if (s_exp_page + 1 < total_pages) {
                 s_exp_page++;
                 draw_explain();
             } else {
                 if (s_qidx == s_qcount - 1) { quiz_finished(); }
-                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_state = 1; draw_quiz(); }
+                else { s_qidx++; s_opt_sel = 0; s_answered = 0; s_show_ans = 0; s_fill_buf[0] = 0; s_fill_ok = 0; s_state = 1; draw_quiz(); }
             }
         }
     } else if (s_state == 15) {         /* 题目全文: 短按翻页, 长按返回 */
@@ -2882,9 +3000,12 @@ static void ui_handle(int ev)
         }
     } else if (s_state == 5) {          /* 键盘: 长按返回 */
         if (ev == 2) {
-            if (s_kb_field == 3) {      /* 知识库主题输入 → 回主题列表 */
+            if (kb_field() == 3) {      /* 知识库主题输入 → 回主题列表 */
                 s_state = 21;
                 draw_kb_topics();
+            } else if (kb_field() == 4) { /* 填空 → 回题目页 */
+                s_state = 1;
+                draw_quiz();
             } else {
                 s_state = 4;
                 draw_settings();
@@ -2949,10 +3070,40 @@ static void ui_handle(int ev)
         } else if (ev == 1) {
             if (s_sel_page + 1 < total_pages) {
                 s_sel_page++;
-                draw_weak_select();
+                draw_weak_select_body();
             } else {
                 s_sel_page = 0;
-                draw_weak_select();
+                draw_weak_select_body();
+            }
+        }
+    } else if (s_state == 22) {             /* 收藏选题: 短按翻页, 长按返回收藏 */
+        int n = fav_count();
+        int total_pages = (n + 3) / 4;
+        if (total_pages < 1) total_pages = 1;
+        if (ev == 2) {
+            s_state = 11;
+            draw_fav_list();
+        } else if (ev == 1) {
+            if (s_sel_fav_page + 1 < total_pages) {
+                s_sel_fav_page++;
+                draw_fav_select_body();
+            } else {
+                s_sel_fav_page = 0;
+                draw_fav_select_body();
+            }
+        }
+    } else if (s_state == 23) {             /* 收藏分析结果: 短按翻页, 长按返回收藏 */
+        int total_pages = (s_wtotal + FULL_LINES - 1) / FULL_LINES;
+        if (ev == 2) {
+            s_state = 11;
+            draw_fav_list();
+        } else if (ev == 1) {
+            if (s_wpage + 1 < total_pages) {
+                s_wpage++;
+                draw_fav_ai_result();
+            } else {
+                s_state = 11;
+                draw_fav_list();
             }
         }
     }
@@ -2962,21 +3113,21 @@ static void ui_handle(int ev)
 static void ui_submit(void)
 {
     const quiz_q_t *q = get_question(s_qlist[s_qidx]);
-    if (!q->is_choice || s_answered)
+    if (q->is_choice != 1 || s_answered)
         return;
     s_answered = 1;
     s_total++;
-    if (s_opt_sel == q->answer_idx) {
+    int ok = (s_opt_sel == q->answer_idx);
+    int si = subj_of(q->subject);
+    if (ok) {
         s_correct++;
-    } else {
+    } else if (si >= 0) {
         /* 答错: 记录到该科薄弱点 */
-        for (int i = 0; i < 9; i++) {
-            if (strcmp(q->subject, s_subjects[i]) == 0) {
-                weak_add_wrong(i, q->content);
-                break;
-            }
-        }
+        weak_add_wrong(si, q->content);
     }
+    /* AI 题: 记录知识点作答统计 (答对答错都记, 驱动薄弱板块强化选题) */
+    if (si >= 0 && s_qlist[s_qidx] == question_count)
+        quiz_record_answer(si, g_ai_q.topic, ok);
 
     /* 只刷新选项+答案区 (题目/顶栏不动; 控件行重画) */
     lcd_fill_rect(0, 104, 479, 271, s_th_bg);
@@ -2991,6 +3142,10 @@ static void ui_submit(void)
     }
     const char *res = (s_opt_sel == q->answer_idx) ? "回答正确" : "回答错误";
     lcd_draw_text(10, 212, res, (s_opt_sel == q->answer_idx) ? GREEN : RED, s_th_bg);
+    /* 答错且该考点处于薄弱强化区: 红色标记 (避开收藏按钮/翻页提示) */
+    if (!ok && si >= 0 && s_qlist[s_qidx] == question_count &&
+        g_ai_q.topic && quiz_topic_weak(si, g_ai_q.topic))
+        lcd_draw_text(270, 212, "薄弱考点", RED, s_th_bg);
     /* 收藏按钮 + 解析翻页提示 (同排, 复用答案条) */
     lcd_draw_rect(340, 210, 470, 230, s_th_border);
     lcd_draw_text(346, 213, fav_contains(q) ? "★已藏" : "☆收藏本题",
@@ -3003,77 +3158,66 @@ static void ui_submit(void)
     }
 }
 
-/* ---------- 测试画面 ---------- */
-static void gfx_test(void)
+/* 填空判分: 双方去掉所有空格 + 忽略大小写.
+ * AI 答案偶有 "2, 2" (逗号后空格) / 英文短语带空格, 去掉空格后比较更宽容 */
+static int fill_match(const char *a, const char *b)
 {
-    lcd_clear(s_th_bg);
+    char pa[64], pb[64];
+    int j = 0;
+    for (const char *p = a; *p && j < 63; p++)
+        if (*p != ' ' && *p != '\t')
+            pa[j++] = *p;
+    pa[j] = 0;
+    j = 0;
+    for (const char *p = b; *p && j < 63; p++)
+        if (*p != ' ' && *p != '\t')
+            pb[j++] = *p;
+    pb[j] = 0;
+    return strcasecmp(pa, pb) == 0;
+}
 
-    /* 色块 */
-    lcd_fill_rect(10, 10, 100, 60, RED);
-    lcd_fill_rect(110, 10, 200, 60, GREEN);
-    lcd_fill_rect(210, 10, 300, 60, s_th_bar);
-    lcd_fill_rect(310, 10, 400, 60, YELLOW);
-    lcd_fill_rect(410, 10, 470, 60, CYAN);
+/* 填空题判分 (键盘 Enter 后调用): 忽略大小写 + 首尾空格比较 */
+static void ui_submit_fill(void)
+{
+    const quiz_q_t *q = get_question(s_qlist[s_qidx]);
+    if (q->is_choice != 2 || s_answered)
+        return;
+    /* 去首尾空格 */
+    char ans[64];
+    int i = 0, j = 0;
+    while (s_fill_buf[i] == ' ')
+        i++;
+    for (; s_fill_buf[i] && j < (int)sizeof(ans) - 1; i++)
+        ans[j++] = s_fill_buf[i];
+    while (j > 0 && ans[j - 1] == ' ')
+        j--;
+    ans[j] = 0;
 
-    /* 网格线 */
-    for (int x = 10; x < 480; x += 40)
-        lcd_draw_vline(x, 80, 180, s_th_border);
-    for (int y = 80; y <= 180; y += 20)
-        lcd_draw_hline(10, 470, y, s_th_border);
-
-    /* 矩形边框 */
-    lcd_draw_rect(10, 200, 150, 260, RED);
-    lcd_draw_rect(160, 200, 300, 260, GREEN);
-    lcd_draw_rect(310, 200, 470, 260, s_th_bar);
-
-    /* ASCII 文字 */
-    lcd_draw_str(10, 205, "Hello ESP32!", s_th_fg, s_th_bg);
-    lcd_draw_str(160, 205, "ST6201 4.3in", s_th_fg, s_th_bg);
-    lcd_draw_str(310, 205, "480x272 SPI", s_th_fg, s_th_bg);
-
-    /* 中文渲染测试 */
-    lcd_draw_text(10, 90, "中文渲染测试", RED, s_th_bg);
-    lcd_draw_text(10, 108, "物理 化学 生物 数学", s_th_fg, s_th_bg);
-    lcd_draw_text(10, 126, "题目: 自由落体运动时间", s_th_fg, s_th_bg);
-    lcd_draw_text(10, 144, "A. 2秒  B. 3秒  C. 4秒", s_th_fg, s_th_bg);
-    lcd_draw_text(10, 162, "解析: 根据 h=1/2gt^2 计算", GREEN, s_th_bg);
-
-    ESP_LOGI(TAG, "gfx test done");
+    s_answered = 1;
+    s_total++;
+    int ok = (ans[0] && q->answer_text &&
+              fill_match(ans, q->answer_text));
+    int si = subj_of(q->subject);
+    if (ok) {
+        s_correct++;
+        s_fill_ok = 1;
+    } else {
+        s_fill_ok = 0;
+        /* 答错: 记录到该科薄弱点 */
+        if (si >= 0)
+            weak_add_wrong(si, q->content);
+    }
+    /* AI 题: 记录知识点作答统计 (答对答错都记, 驱动薄弱板块强化选题) */
+    if (si >= 0 && s_qlist[s_qidx] == question_count)
+        quiz_record_answer(si, g_ai_q.topic, ok);
+    draw_quiz();
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ST6201 GFX test start");
+    ESP_LOGI(TAG, "st6201 quiz app start");
 
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << PIN_DC) | (1ULL << PIN_RST) | (1ULL << PIN_CS),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
-    gpio_set_level(PIN_CS, 1);
-
-    spi_bus_config_t bus = {
-        .sclk_io_num = PIN_SCK,
-        .mosi_io_num = PIN_MOSI,
-        .miso_io_num = -1,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 8192,
-    };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
-
-    spi_device_interface_config_t dev = {
-        .clock_speed_hz = 26000000,        /* GPIO matrix 上限 26.6MHz (实测 40MHz 不支持) */
-        .mode = 0,
-        .spics_io_num = -1,
-        .queue_size = 4,
-    };
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &s_spi));
-
-    lcd_init();
+    gfx_init();            /* SPI 总线 + LCD 初始化 */
     backlight_init();      /* 背光 PWM (主题/亮度) */
 
     /* NVS (设置存储) */
@@ -3119,37 +3263,113 @@ void app_main(void)
             t_py = ty;
             t_press_at = now;
             t_long_sent = 0;
+            if (s_state == 5) {              /* 键盘: 按下立即高亮 (脏矩形) */
+                int sx = t_px * LCD_WIDTH / s_xmax;
+                int sy = t_py * LCD_HEIGHT / s_ymax;
+                kb_press(sx, sy);
+            }
+        } else if (tnow && prev_touch && !t_long_sent) {
+            if (s_state == 5) {
+                kb_hold(now - t_press_at);   /* 键盘: 退格长按连删 */
+            } else if (now - t_press_at >= 900) {
+                int lp_ok = (s_state == 4 || s_state == 6 || s_state == 7
+                             || s_state == 8 || s_state == 10 || s_state == 11
+                             || s_state == 12 || s_state == 13 || s_state == 14
+                             || s_state == 15 || s_state == 16
+                             || s_state == 17 || s_state == 18 || s_state == 19
+                             || s_state == 20 || s_state == 21
+                             || s_state == 22 || s_state == 23);
+                if (s_state == 1)
+                    lp_ok = (t_py < 26 * s_ymax / LCD_HEIGHT);  /* 顶栏长按返回 */
+                else if (s_state == 3)
+                    lp_ok = 1;                /* 解析页长按返回答题 */
+                if (lp_ok) {
+                    t_long_sent = 1;
+                    ESP_LOGI(TAG, "touch long press");
+                    if (s_state == 1)
+                        quiz_back();          /* 顶栏长按 = 返回 */
+                    else if (s_state == 3) {
+                        s_state = 1;          /* 解析页长按 = 返回答题页 */
+                        draw_quiz();
+                    } else {
+                        ui_handle(2);         /* 触摸长按 = 返回 */
+                    }
+                }
+            }
         } else if (!tnow && prev_touch && !t_long_sent) {
             int sx = t_px * LCD_WIDTH / s_xmax;
             int sy = t_py * LCD_HEIGHT / s_ymax;
             ESP_LOGI(TAG, "tap %d,%d", sx, sy);
-            ui_touch(sx, sy);
-        } else if (tnow && prev_touch && !t_long_sent
-                   && now - t_press_at >= 900) {
-            int lp_ok = (s_state == 4 || s_state == 6 || s_state == 7
-                         || s_state == 8 || s_state == 10 || s_state == 11
-                         || s_state == 12 || s_state == 13 || s_state == 14
-                         || s_state == 15 || s_state == 16 || s_state == 5
-                         || s_state == 17 || s_state == 18 || s_state == 19
-                         || s_state == 20 || s_state == 21);
-            if (s_state == 1)
-                lp_ok = (t_py < 26 * s_ymax / LCD_HEIGHT);  /* 顶栏长按返回 */
-            else if (s_state == 3)
-                lp_ok = 1;                    /* 解析页长按返回答题 */
-            if (lp_ok) {
-                t_long_sent = 1;
-                ESP_LOGI(TAG, "touch long press");
-                if (s_state == 1)
-                    quiz_back();              /* 顶栏长按 = 返回 */
-                else if (s_state == 3) {
-                    s_state = 1;              /* 解析页长按 = 返回答题页 */
-                    draw_quiz();
-                } else {
-                    ui_handle(2);             /* 触摸长按 = 返回 */
+            if (s_state == 5) {
+                /* 顶栏返回按钮 (放弃输入): 填空→题目页, 主题→列表, 其他→设置 */
+                if (sy < 26 && sx >= 240 && sx < 330) {
+                    int f = kb_field();
+                    if (f == 4) {
+                        s_state = 1;
+                        draw_quiz();
+                    } else if (f == 3) {
+                        s_state = 21;
+                        draw_kb_topics();
+                    } else {
+                        s_state = 4;
+                        draw_settings();
+                    }
+                } else if (kb_release(sx, sy)) {
+                    int f = kb_field();
+                    if (f == 0) {
+                        strncpy(s_wifi_ssid, kb_buffer(), sizeof(s_wifi_ssid) - 1);
+                        s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = 0;
+                    } else if (f == 1) {
+                        strncpy(s_wifi_pass, kb_buffer(), sizeof(s_wifi_pass) - 1);
+                        s_wifi_pass[sizeof(s_wifi_pass) - 1] = 0;
+                        wifi_connect_now();
+                    } else if (f == 2) {
+                        strncpy(s_api_key, kb_buffer(), sizeof(s_api_key) - 1);
+                        s_api_key[sizeof(s_api_key) - 1] = 0;
+                    } else if (f == 4) {      /* 填空答案: 判分 */
+                        strncpy(s_fill_buf, kb_buffer(), sizeof(s_fill_buf) - 1);
+                        s_fill_buf[sizeof(s_fill_buf) - 1] = 0;
+                        s_state = 1;
+                        ui_submit_fill();
+                        goto kb_done;
+                    } else {                  /* 知识库自定义主题 */
+                        strncpy(s_kb_custom, kb_buffer(), sizeof(s_kb_custom) - 1);
+                        s_kb_custom[sizeof(s_kb_custom) - 1] = 0;
+                        if (!s_kb_custom[0]) {  /* 空主题名: 提示 */
+                            lcd_clear(s_th_bg);
+                            text_center(110, "主题名不能为空", RED, s_th_bg);
+                            text_center(140, "点击返回主题列表", s_th_border, s_th_bg);
+                            s_state = 18;
+                            goto kb_done;
+                        }
+                        s_kb_custom_mode = 1;
+                        s_state = 18;
+                        kb_run();
+                        goto kb_done;
+                    }
+                    s_state = 4;
+                    draw_settings();
+                kb_done: ;
                 }
+            } else {
+                ui_touch(sx, sy);
             }
         }
         prev_touch = tnow;
+
+        /* 顶栏时间刷新: 每分钟检查一次 (分钟变化才重画时间区) */
+        static uint32_t t_last_clock = 0;
+        if (s_time_str[0] && now - t_last_clock > 30000) {
+            t_last_clock = now;
+            char old[16];
+            strncpy(old, s_time_str, sizeof(old) - 1);
+            old[sizeof(old) - 1] = 0;
+            time_refresh();
+            if (strcmp(old, s_time_str) != 0 && s_state != 5) {
+                lcd_fill_rect(240, 2, 330, 15, s_th_bar);   /* 清时间区 */
+                draw_small_str(240, 4, s_time_str, s_th_bar_fg, s_th_bar);
+            }
+        }
 
         /* BOOT 键兜底 */
         uint32_t press_ms = 0;
